@@ -1,0 +1,32 @@
+# 核心依赖
+streamlit>=1.30.0
+pydantic>=2.5.0
+
+# 数据处理
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+scipy>=1.11.0
+pandas>=2.1.0
+
+# 可视化
+matplotlib>=3.8.0
+seaborn>=0.13.0
+plotly>=5.18.0
+
+# AI 和 RAG
+chromadb>=0.4.20
+openai>=1.10.0
+anthropic>=0.52.0
+tenacity>=8.2.0
+
+# HTTP 请求
+requests>=2.31.0
+
+# 工具
+tqdm>=4.66.0
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# 测试
+pytest>=7.4.0
+pytest-cov>=4.1.0

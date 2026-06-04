@@ -1,0 +1,39 @@
+{
+  "claude-sonnet-4-6": {
+    "type": "claude",
+    "api_key": "${ANTHROPIC_API_KEY}",
+    "model": "claude-sonnet-4-6",
+    "description": "Supervisor Agent - 用于出题和错误分析"
+  },
+  "claude-opus-4": {
+    "type": "claude",
+    "api_key": "${ANTHROPIC_API_KEY}",
+    "model": "claude-opus-4",
+    "description": "高级 Supervisor Agent"
+  },
+  "gpt-4o": {
+    "type": "openai",
+    "api_key": "${OPENAI_API_KEY}",
+    "model": "gpt-4o",
+    "description": "备选 Supervisor Agent"
+  },
+  "kimi": {
+    "type": "kimi",
+    "api_key": "${MOONSHOT_API_KEY}",
+    "model": "moonshot-v1-128k",
+    "description": "被测模型 - 长上下文空间记忆测试"
+  },
+  "minimax": {
+    "type": "minimax",
+    "api_key": "${MINIMAX_API_KEY}",
+    "group_id": "${MINIMAX_GROUP_ID}",
+    "model": "abab6.5-chat",
+    "description": "被测模型 - 多模态辨识度测试"
+  },
+  "doubao": {
+    "type": "doubao",
+    "api_key": "${DOUBAO_API_KEY}",
+    "endpoint": "${DOUBAO_ENDPOINT}",
+    "description": "被测模型 - 空间几何计算测试"
+  }
+}

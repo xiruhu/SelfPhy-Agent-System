@@ -1,0 +1,49 @@
+{
+  "claude-sonnet-4-6": {
+    "type": "claude",
+    "api_key": "${ANTHROPIC_API_KEY}",
+    "model": "claude-sonnet-4-6",
+    "base_url": "${ANTHROPIC_BASE_URL}"
+  },
+  "claude-opus-4": {
+    "type": "claude",
+    "api_key": "${ANTHROPIC_API_KEY}",
+    "model": "claude-opus-4",
+    "base_url": "${ANTHROPIC_BASE_URL}"
+  },
+  "claude-haiku-4": {
+    "type": "claude",
+    "api_key": "${ANTHROPIC_API_KEY}",
+    "model": "claude-haiku-4",
+    "base_url": "${ANTHROPIC_BASE_URL}"
+  },
+  "gpt-4o": {
+    "type": "openai",
+    "api_key": "${OPENAI_API_KEY}",
+    "model": "gpt-4o",
+    "base_url": "${OPENAI_BASE_URL}"
+  },
+  "gpt-4o-mini": {
+    "type": "openai",
+    "api_key": "${OPENAI_API_KEY}",
+    "model": "gpt-4o-mini",
+    "base_url": "${OPENAI_BASE_URL}"
+  },
+  "kimi": {
+    "type": "kimi",
+    "api_key": "${MOONSHOT_API_KEY}",
+    "model": "kimi-k2.5",
+    "base_url": "${MOONSHOT_BASE_URL}"
+  },
+  "minimax": {
+    "type": "minimax",
+    "api_key": "${MINIMAX_API_KEY}",
+    "group_id": "${MINIMAX_BASE_URL}",
+    "model": "MiniMax-M2.7"
+  },
+  "doubao": {
+    "type": "doubao",
+    "api_key": "${DOUBAO_API_KEY}",
+    "endpoint": "${DOUBAO_ENDPOINT}"
+  }
+}
