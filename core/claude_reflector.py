@@ -1,454 +1,302 @@
 """
-错题分析器 (Inspector Agent)
-负责四步排除法错误诊断和根因分析
+claude_reflector.py
+----------------------
+四步排除法错题诊断系统 V2
+
+输入：EvaluationResultV2（模型评测结果）+ ExamPaperV2（考卷含真实轨迹）
+输出：每道错题的 ErrorAnalysisV2（证据链 + 根因分类）
+
+四步排除法：
+  Step 1: 物理-语义对齐检查  — 模型说的方向是否物理上可能？
+  Step 2: 空间位置重塑验证  — 基于精确位姿，反算正确答案，量化偏差
+  Step 3: 视场边界校验      — 物体是否在视野范围内？是否被遮挡？
+  Step 4: 根因分类归纳      — 综合前三步，输出结构化根因
+
+长官模型：claude-sonnet-4-6（只有它才接受多模态输入 + 执行推理）
 """
 
 import json
 import os
+import sys
+import base64
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, asdict
 from datetime import datetime
 from enum import Enum
-import numpy as np
+
+import anthropic
+from dotenv import load_dotenv
+
+sys.path.append(str(Path(__file__).parent.parent))
+from schema.question import QuestionV2, EvaluationResultV2
+
+load_dotenv()
+
+SUPERVISOR_MODEL = "claude-sonnet-4-6"
+client = anthropic.Anthropic(
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+)
 
 
 class ErrorType(str, Enum):
-    """错误类型"""
-    PHYSICAL_MISALIGNMENT = "physical_misalignment"
-    SPATIAL_TOPOLOGY_ERROR = "spatial_topology_error"
-    FOV_BOUNDARY_ISSUE = "fov_boundary_issue"
-    MEMORY_DECAY = "memory_decay"
-    OBJECT_HALLUCINATION = "object_hallucination"
-    OCCLUSION_MISUNDERSTANDING = "occlusion_misunderstanding"
+    DIRECTION_CALC_ERROR    = "direction_calc_error"      # 坐标系变换计算错误
+    ROTATION_SENSE_ERROR    = "rotation_sense_error"      # 旋转方向（顺/逆时针）判断反了
+    ROTATION_TRANSLATION_CONFUSION = "rotation_translation_confusion"  # 旋转与平移混淆
+    MEMORY_DECAY            = "memory_decay"              # 跨帧记忆丢失
+    OBJECT_HALLUCINATION    = "object_hallucination"      # 幻觉物体
+    FOV_MISUNDERSTANDING    = "fov_misunderstanding"      # 视场/遮挡理解错误
 
 
-@dataclass
-class CausalTraceStep:
-    """因果追踪步骤"""
-    step_name: str
-    hypothesis: str
-    evidence: List[str]
-    conclusion: str
-    confidence: float
-    supporting_data: Optional[Dict[str, Any]] = None
+# 每种错误类型的诊断提示词
+_ERROR_HINTS = {
+    ErrorType.DIRECTION_CALC_ERROR:
+        "模型感知到了旋转，但最终角度计算有误（如把-270°误算为+180°）",
+    ErrorType.ROTATION_SENSE_ERROR:
+        "模型把顺时针旋转看成了逆时针，或反之",
+    ErrorType.ROTATION_TRANSLATION_CONFUSION:
+        "模型把视角旋转（原地转身）产生的画面变化当成了位置移动",
+    ErrorType.MEMORY_DECAY:
+        "模型在中间帧丢失了对目标物体的空间记忆",
+    ErrorType.OBJECT_HALLUCINATION:
+        "模型描述了视频中并不存在的物体",
+    ErrorType.FOV_MISUNDERSTANDING:
+        "模型错误推断了物体的可见性或遮挡状态",
+}
 
 
-@dataclass
-class ErrorAnalysis:
-    """错误分析报告"""
-    question_id: str
-    model_name: str
-    error_type: ErrorType
-    causal_trace: List[CausalTraceStep]
-    retrieved_rules: List[str]
-    root_cause: str
-    confidence: float
-    visualization_data: Optional[Dict[str, Any]] = None
-    timestamp: str = None
-
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.now().isoformat()
+def encode_image(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
 
-class InspectorAgent:
-    """错题分析器 - 四步排除法"""
+def analyze_one_error(
+    question: Dict,
+    response: Dict,
+    exam_evidence: Dict,
+    traj_data: List[Dict]
+) -> Dict:
+    """
+    对单道错题执行四步排除法。
 
-    def __init__(
-        self,
-        supervisor_api_key: str = None,
-        supervisor_model: str = "claude-sonnet-4-6",
-        use_claude: bool = True
-    ):
-        self.supervisor_model = supervisor_model
-        self.use_claude = use_claude
-        self.output_dir = Path("outputs/reports")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    Args:
+        question:      exam_v2.json 中的题目字典
+        response:      EvaluationResultV2 中对应的 response 字典
+        exam_evidence: exam_v2.json 中的 multimodal_evidence
+        traj_data:     完整关键帧位姿序列（来自 metadata.json）
 
-        # 初始化 Claude 或 OpenAI 客户端
-        if use_claude:
-            self.supervisor_api_key = supervisor_api_key or os.getenv("ANTHROPIC_API_KEY")
-            base_url = os.getenv("ANTHROPIC_BASE_URL")
-            if self.supervisor_api_key:
-                from anthropic import Anthropic
-                self.client = Anthropic(api_key=self.supervisor_api_key, base_url=base_url)
-                print(f"[Inspector] Using Claude model: {supervisor_model}")
-            else:
-                self.client = None
-                print("[Warning] No ANTHROPIC_API_KEY provided, using rule-based analysis only")
-        else:
-            self.supervisor_api_key = supervisor_api_key or os.getenv("OPENAI_API_KEY")
-            if self.supervisor_api_key:
-                from openai import OpenAI
-                self.client = OpenAI(api_key=self.supervisor_api_key)
-                print(f"[Inspector] Using OpenAI model: {supervisor_model}")
-            else:
-                self.client = None
-                print("[Warning] No supervisor API key provided, using rule-based analysis only")
+    Returns:
+        ErrorAnalysisV2 字典
+    """
+    q_id       = question["question_id"]
+    capability = question["capability"]
+    gt         = question["ground_truth_answer"]
+    model_ans  = response["model_response"]
+    score      = response.get("score", 0.0)
 
-    def analyze_errors(
-        self,
-        responses_path: str,
-        questions_path: str,
-        trajectory_path: str
-    ) -> List[ErrorAnalysis]:
-        """
-        批量分析错误
+    # 取证据帧范围内的位姿数据
+    eids = question.get("evidence_frame_ids", [])
+    if eids:
+        min_f, max_f = min(eids), max(eids)
+        traj_window = [t for t in traj_data if min_f <= t["frame_id"] <= max_f]
+    else:
+        traj_window = traj_data
 
-        Args:
-            responses_path: 模型响应文件路径
-            questions_path: 问题文件路径
-            trajectory_path: 轨迹文件路径
+    # 格式化轨迹摘要（传给 Claude 的文本部分）
+    traj_lines = "\n".join(
+        f"  frame {t['frame_id']:>3}: yaw={t['yaw']:>8.2f}°  cum_yaw={t['cum_yaw_delta']:>8.2f}°  cum_disp={t['cum_displacement']:>6.3f}m"
+        for t in traj_window
+    )
 
-        Returns:
-            错误分析报告列表
-        """
-        # 加载数据
-        with open(responses_path, 'r', encoding='utf-8') as f:
-            responses = json.load(f)
+    # 选首尾两帧图像作为视觉证据（避免 token 过多）
+    image_blocks = []
+    rgb_frames = exam_evidence.get("rgb_frames", {})
+    selected_fids = []
+    if eids:
+        selected_fids = [eids[0], eids[len(eids)//2], eids[-1]]
+    for fid in selected_fids:
+        path = rgb_frames.get(str(fid))
+        if path and Path(path).exists():
+            image_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg",
+                           "data": encode_image(path)}
+            })
+            image_blocks.append({"type": "text", "text": f"[frame {fid}]"})
 
-        with open(questions_path, 'r', encoding='utf-8') as f:
-            questions = json.load(f)
+    prompt = f"""你是 SelfPhy-Agent-System 的错题诊断专家（Inspector Agent V2）。
 
-        with open(trajectory_path, 'r', encoding='utf-8') as f:
-            trajectory = json.load(f)
+## 题目信息
+- 题目 ID: {q_id}
+- 能力维度: {capability}
+- 标准答案: {gt}
+- 模型回答: {model_ans}
+- 答题得分: {score:.2f}/1.00
 
-        # 构建问题字典
-        questions_dict = {q['question_id']: q for q in questions}
+## 证据帧图像（已附上首/中/尾帧）
 
-        analyses = []
+## 精确位姿轨迹（证据帧范围内）
+{traj_lines}
 
-        print(f"\n[Analysis] Processing {len(responses)} responses...")
+## 你的任务：执行四步排除法
 
-        for response in responses:
-            question = questions_dict.get(response['question_id'])
-            if not question:
-                continue
+**Step 1 - 物理-语义对齐检查**
+模型的回答在语义上是否符合场景的物理约束？是否描述了不可能存在的物体或方向？
 
-            # 判断是否错误
-            is_correct = self._check_correctness(response, question)
+**Step 2 - 空间位置重塑验证**
+根据精确位姿轨迹，计算正确答案：
+- 起始 yaw = 轨迹第一帧 yaw
+- 终止 yaw = 轨迹最后一帧 yaw
+- 累计转向 cum_yaw_delta = 终止 - 起始
+- 若物体初始在方向 θ₀，则终止时相对方向 = θ₀ - cum_yaw_delta（规范化到 [-180°, 180°]）
+写出完整的数值推导过程，与模型回答对比，量化偏差。
 
-            if not is_correct:
-                print(f"\n[Analyzing] {response['question_id']}...")
+**Step 3 - 视场边界校验**
+根据图像帧和位姿，判断：目标物体在关键帧时是否在视野内（默认 FOV=90°）？是否被遮挡？
 
-                analysis = self._analyze_single_error(
-                    response,
-                    question,
-                    trajectory
-                )
+**Step 4 - 根因分类**
+从以下类型中选一个最匹配的根因：
+{json.dumps({e.value: h for e, h in _ERROR_HINTS.items()}, ensure_ascii=False, indent=2)}
 
-                analyses.append(analysis)
+## 输出格式（严格 JSON，不加 markdown）
+{{
+  "step1_physical_check": {{
+    "has_hallucination": false,
+    "physical_violation": "描述或 null",
+    "conclusion": "通过/发现问题"
+  }},
+  "step2_spatial_reconstruction": {{
+    "start_yaw": 数值,
+    "end_yaw": 数值,
+    "cum_yaw_delta": 数值,
+    "correct_answer_calc": "推导过程",
+    "model_answer_deviation": "偏差描述"
+  }},
+  "step3_fov_check": {{
+    "object_in_fov": true或false,
+    "occlusion_ratio": 0到1,
+    "conclusion": "描述"
+  }},
+  "step4_root_cause": {{
+    "error_type": "错误类型枚举值",
+    "confidence": 0到1,
+    "explanation": "解释"
+  }}
+}}"""
 
-        return analyses
+    content = [{"type": "text", "text": prompt}] + image_blocks
 
-    def _check_correctness(self, response: Dict, question: Dict) -> bool:
-        """检查答案是否正确"""
-        ground_truth = question['ground_truth']
-        parsed_answer = response['parsed_answer']
-
-        # 如果有错误，直接判定为错误
-        if 'error' in parsed_answer:
-            return False
-
-        # 如果响应为空或太短，判定为错误
-        raw_response = response.get('raw_response', '')
-        if not raw_response or len(raw_response.strip()) < 10:
-            return False
-
-        # 检查方向
-        if 'direction' in ground_truth:
-            gt_direction = ground_truth['direction'].lower()
-            response_text = raw_response.lower()
-
-            # 检查关键词是否匹配
-            direction_keywords = gt_direction.split()
-            matches = sum(1 for kw in direction_keywords if kw in response_text)
-
-            if matches < len(direction_keywords) * 0.5:
-                return False
-
-        # 检查距离
-        if 'distance_meters' in ground_truth:
-            gt_distance = ground_truth['distance_meters']
-            extracted_distance = parsed_answer.get('extracted_distance')
-
-            if extracted_distance is not None:
-                error_ratio = abs(extracted_distance - gt_distance) / max(gt_distance, 0.1)
-                if error_ratio > 0.3:  # 30% 误差阈值
-                    return False
-
-        return True
-
-    def _analyze_single_error(
-        self,
-        response: Dict,
-        question: Dict,
-        trajectory: Dict
-    ) -> ErrorAnalysis:
-        """
-        四步排除法分析单个错误
-
-        步骤：
-        1. 物理及语义对齐检查
-        2. 空间位置重塑验证
-        3. 视场边界校验
-        4. 根因分类归纳
-        """
-        causal_trace = []
-
-        # Step 1: 物理及语义对齐
-        step1 = self._step1_physical_alignment(response, question, trajectory)
-        causal_trace.append(step1)
-
-        # Step 2: 空间位置重塑
-        step2 = self._step2_spatial_reconstruction(response, question, trajectory)
-        causal_trace.append(step2)
-
-        # Step 3: 视场边界校验
-        step3 = self._step3_fov_verification(response, question, trajectory)
-        causal_trace.append(step3)
-
-        # Step 4: 根因分类
-        error_type, root_cause = self._step4_root_cause_classification(causal_trace)
-
-        # 计算总体置信度
-        confidence = np.mean([step.confidence for step in causal_trace])
-
-        analysis = ErrorAnalysis(
-            question_id=question['question_id'],
-            model_name=response['model_name'],
-            error_type=error_type,
-            causal_trace=causal_trace,
-            retrieved_rules=[],  # TODO: 集成 RAG
-            root_cause=root_cause,
-            confidence=confidence
+    try:
+        resp = client.messages.create(
+            model=SUPERVISOR_MODEL,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": content}]
         )
+        raw = resp.content[0].text.strip()
 
-        return analysis
+        # 解析 JSON
+        import re
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        diagnosis = json.loads(m.group(0)) if m else {"raw": raw}
 
-    def _step1_physical_alignment(
-        self,
-        response: Dict,
-        question: Dict,
-        trajectory: Dict
-    ) -> CausalTraceStep:
-        """步骤 1: 物理及语义对齐检查"""
-        hypothesis = "Model's answer violates physical laws or semantic understanding"
-        evidence = []
-        confidence = 0.5
+    except Exception as e:
+        diagnosis = {"error": str(e)}
 
-        # 检查物理一致性
-        ground_truth = question['ground_truth']
-        parsed_answer = response['parsed_answer']
+    root_cause = diagnosis.get("step4_root_cause", {})
 
-        # 检查方向是否合理
-        if 'direction' in ground_truth:
-            gt_direction = ground_truth['direction']
-            response_text = response['raw_response'].lower()
+    return {
+        "question_id": q_id,
+        "capability": capability,
+        "model_name": response.get("model_name", "unknown"),
+        "ground_truth": gt,
+        "model_answer": model_ans,
+        "score": score,
+        "diagnosis": diagnosis,
+        "error_type": root_cause.get("error_type", "unknown"),
+        "confidence": root_cause.get("confidence", 0.0),
+        "root_cause_explanation": root_cause.get("explanation", ""),
+        "timestamp": datetime.now().isoformat()
+    }
 
-            # 检查是否提到了相反的方向
-            opposite_directions = {
-                'left': 'right', 'right': 'left',
-                'front': 'behind', 'behind': 'front'
-            }
 
-            for direction, opposite in opposite_directions.items():
-                if direction in gt_direction.lower() and opposite in response_text:
-                    evidence.append(f"Model mentioned opposite direction: {opposite}")
-                    confidence = 0.8
+def run_reflector_v2(
+    result_path: str,
+    exam_path: str,
+    metadata_path: str,
+    output_path: str = None
+) -> List[Dict]:
+    """
+    对评测结果中所有错题执行四步排除法诊断。
 
-        if evidence:
-            conclusion = "Physical misalignment detected"
-        else:
-            conclusion = "No obvious physical violations"
-            confidence = 0.3
+    Args:
+        result_path:   test_result_kimi_v2_final.json
+        exam_path:     test_exam_v2_precise.json
+        metadata_path: metadata.json（含完整位姿序列）
+        output_path:   输出路径
 
-        return CausalTraceStep(
-            step_name="Physical Alignment Check",
-            hypothesis=hypothesis,
-            evidence=evidence,
-            conclusion=conclusion,
-            confidence=confidence
-        )
+    Returns:
+        错题诊断列表
+    """
+    from core.claude_examiner import compute_cumulative_trajectory
 
-    def _step2_spatial_reconstruction(
-        self,
-        response: Dict,
-        question: Dict,
-        trajectory: Dict
-    ) -> CausalTraceStep:
-        """步骤 2: 空间位置重塑验证"""
-        hypothesis = "Model failed to reconstruct spatial topology correctly"
-        evidence = []
-        confidence = 0.5
+    with open(result_path, "r", encoding="utf-8") as f:
+        result = json.load(f)
+    with open(exam_path, "r", encoding="utf-8") as f:
+        exam = json.load(f)
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
 
-        # 检查空间推理
-        ground_truth = question['ground_truth']
+    model_name = result["model_name"]
+    questions   = {q["question_id"]: q for q in exam["questions"]}
+    evidence    = exam["multimodal_evidence"]
+    traj_data   = compute_cumulative_trajectory(metadata["keyframes"])
 
-        if 'relative_position' in ground_truth:
-            gt_pos = np.array(ground_truth['relative_position'])
-            distance = np.linalg.norm(gt_pos)
+    # 只处理答错的题
+    wrong_responses = [r for r in result["responses"] if not r["is_correct"]]
+    print(f"\n[Reflector V2] 开始诊断 {len(wrong_responses)} 道错题（模型: {model_name}）")
 
-            # 检查模型是否提到了距离
-            response_text = response['raw_response'].lower()
-            has_distance = any(word in response_text for word in ['meter', 'distance', 'far', 'close'])
+    analyses = []
+    for i, resp in enumerate(wrong_responses, 1):
+        qid = resp["question_id"]
+        q   = questions.get(qid)
+        if q is None:
+            continue
+        print(f"  [{i}/{len(wrong_responses)}] {qid} ...")
+        resp["model_name"] = model_name
+        analysis = analyze_one_error(q, resp, evidence, traj_data)
+        analyses.append(analysis)
+        print(f"    根因: {analysis['error_type']} (置信度: {analysis['confidence']:.2f})")
 
-            if not has_distance:
-                evidence.append("Model did not mention distance")
-                confidence = 0.7
+    # 保存
+    if output_path is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"outputs/reports/diagnosis_{model_name}_{ts}.json"
 
-            # 检查距离估计是否合理
-            extracted_distance = response['parsed_answer'].get('extracted_distance')
-            if extracted_distance is not None:
-                error_ratio = abs(extracted_distance - distance) / max(distance, 0.1)
-                if error_ratio > 0.5:
-                    evidence.append(f"Distance estimation error: {error_ratio:.1%}")
-                    confidence = 0.8
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(analyses, f, indent=2, ensure_ascii=False)
 
-        if evidence:
-            conclusion = "Spatial reconstruction error detected"
-        else:
-            conclusion = "Spatial topology appears correct"
-            confidence = 0.3
+    print(f"\n✅ 诊断报告已保存: {output_path}")
 
-        return CausalTraceStep(
-            step_name="Spatial Reconstruction",
-            hypothesis=hypothesis,
-            evidence=evidence,
-            conclusion=conclusion,
-            confidence=confidence
-        )
+    # 统计错误类型分布
+    from collections import Counter
+    type_dist = Counter(a["error_type"] for a in analyses)
+    print("\n错误类型分布:")
+    for etype, cnt in type_dist.most_common():
+        print(f"  {etype}: {cnt} 道")
 
-    def _step3_fov_verification(
-        self,
-        response: Dict,
-        question: Dict,
-        trajectory: Dict
-    ) -> CausalTraceStep:
-        """步骤 3: 视场边界校验"""
-        hypothesis = "Object was outside field of view"
-        evidence = []
-        confidence = 0.5
-
-        # 检查是否是视场问题
-        response_text = response['raw_response'].lower()
-
-        # 检查模型是否提到看不见
-        visibility_keywords = ['cannot see', 'not visible', 'out of view', 'behind']
-        has_visibility_issue = any(kw in response_text for kw in visibility_keywords)
-
-        if has_visibility_issue:
-            evidence.append("Model mentioned visibility issues")
-            confidence = 0.7
-
-        # 检查时间间隔
-        time_gap = question.get('time_gap', 0)
-        if time_gap > 5:
-            evidence.append(f"Large time gap: {time_gap} frames")
-            confidence = 0.6
-
-        if evidence:
-            conclusion = "Possible FOV boundary issue"
-        else:
-            conclusion = "FOV appears adequate"
-            confidence = 0.3
-
-        return CausalTraceStep(
-            step_name="FOV Verification",
-            hypothesis=hypothesis,
-            evidence=evidence,
-            conclusion=conclusion,
-            confidence=confidence
-        )
-
-    def _step4_root_cause_classification(
-        self,
-        causal_trace: List[CausalTraceStep]
-    ) -> tuple[ErrorType, str]:
-        """步骤 4: 根因分类归纳"""
-        # 基于前三步的置信度决定错误类型
-        confidences = {step.step_name: step.confidence for step in causal_trace}
-
-        max_confidence_step = max(confidences, key=confidences.get)
-
-        if max_confidence_step == "Physical Alignment Check":
-            return ErrorType.PHYSICAL_MISALIGNMENT, "Model violated physical laws or semantic understanding"
-        elif max_confidence_step == "Spatial Reconstruction":
-            return ErrorType.SPATIAL_TOPOLOGY_ERROR, "Model failed to reconstruct spatial topology"
-        elif max_confidence_step == "FOV Verification":
-            return ErrorType.FOV_BOUNDARY_ISSUE, "Object was outside field of view or occluded"
-        else:
-            return ErrorType.MEMORY_DECAY, "Model forgot spatial information over time"
-
-    def save_analyses(
-        self,
-        analyses: List[ErrorAnalysis],
-        output_filename: str = None
-    ) -> str:
-        """保存分析报告"""
-        if output_filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"error_analysis_{timestamp}.json"
-
-        output_path = self.output_dir / output_filename
-
-        analyses_dict = []
-        for analysis in analyses:
-            analysis_dict = asdict(analysis)
-            # 转换 Enum
-            analysis_dict['error_type'] = analysis.error_type.value
-            analyses_dict.append(analysis_dict)
-
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(analyses_dict, f, indent=2, ensure_ascii=False)
-
-        print(f"\n[Saved] {len(analyses)} error analyses to {output_path}")
-
-        return str(output_path)
+    return analyses
 
 
 def main():
-    """主函数：运行错误分析"""
-    inspector = InspectorAgent()
-
-    # 示例路径
-    responses_path = "outputs/answers/responses_claude-sonnet-4-6_20260526_120000.json"
-    questions_path = "outputs/exams/exam_episode_001.json"
-    trajectory_path = "outputs/trajectories/episode_001.json"
-
-    # 检查文件是否存在
-    for path in [responses_path, questions_path, trajectory_path]:
-        if not Path(path).exists():
-            print(f"[Error] File not found: {path}")
-            print("Please run the previous steps first.")
-            return
-
-    try:
-        analyses = inspector.analyze_errors(
-            responses_path=responses_path,
-            questions_path=questions_path,
-            trajectory_path=trajectory_path
-        )
-
-        # 保存分析
-        inspector.save_analyses(analyses)
-
-        # 统计
-        error_types = {}
-        for analysis in analyses:
-            error_type = analysis.error_type.value
-            error_types[error_type] = error_types.get(error_type, 0) + 1
-
-        print(f"\n[Summary] Total errors analyzed: {len(analyses)}")
-        print("Error type distribution:")
-        for error_type, count in error_types.items():
-            print(f"  - {error_type}: {count}")
-
-    except Exception as e:
-        print(f"[Error] Analysis failed: {e}")
-        import traceback
-        traceback.print_exc()
+    import argparse
+    parser = argparse.ArgumentParser(description="Claude Reflector V2 - 四步排除法错题诊断")
+    parser.add_argument("result",   help="EvaluationResultV2 JSON 路径")
+    parser.add_argument("exam",     help="ExamPaperV2 JSON 路径")
+    parser.add_argument("metadata", help="metadata.json 路径")
+    parser.add_argument("-o", "--output", help="输出路径")
+    args = parser.parse_args()
+    run_reflector_v2(args.result, args.exam, args.metadata, args.output)
 
 
 if __name__ == "__main__":

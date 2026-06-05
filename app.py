@@ -1,316 +1,264 @@
 """
-Streamlit 交互看板
-提供 Web 界面展示评测结果
+app_v2.py
+---------
+SelfPhy-Agent-System V2 Streamlit 看板
+
+功能：
+1. 总览页：多模型准确率对比 + 能力热力图
+2. 题目详情：逐题查看问题、Kimi 回答、标准答案、图像帧
+3. 诊断报告：四步排除法输出，错误类型分布
+4. 原始数据：JSON 浏览器
+
+运行：
+  streamlit run app_v2.py -- \
+    --results kimi:outputs/test_result_kimi_v2_final.json \
+    --exam outputs/test_exam_v2_precise.json
 """
 
-import streamlit as st
 import json
-import pandas as pd
+import sys
+import base64
 from pathlib import Path
 from collections import Counter
-import plotly.express as px
-import plotly.graph_objects as go
 
+import streamlit as st
 
+# ──────────────────────────────────────────
 # 页面配置
+# ──────────────────────────────────────────
+
 st.set_page_config(
-    page_title="SelfPhy-Agent-System",
-    page_icon="🤖",
-    layout="wide"
+    page_title="SelfPhy-Agent-System V2",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+# ──────────────────────────────────────────
+# 数据加载（带缓存）
+# ──────────────────────────────────────────
 
-def load_data():
-    """加载所有数据"""
-    data = {
-        "trajectories": [],
-        "questions": [],
-        "responses": [],
-        "analyses": []
-    }
-
-    # 加载轨迹
-    traj_dir = Path("outputs/trajectories")
-    if traj_dir.exists():
-        for traj_file in traj_dir.glob("*.json"):
-            with open(traj_file, 'r', encoding='utf-8') as f:
-                data["trajectories"].append(json.load(f))
-
-    # 加载考题
-    exam_dir = Path("outputs/exams")
-    if exam_dir.exists():
-        for exam_file in exam_dir.glob("*.json"):
-            with open(exam_file, 'r', encoding='utf-8') as f:
-                data["questions"].extend(json.load(f))
-
-    # 加载响应
-    answer_dir = Path("outputs/answers")
-    if answer_dir.exists():
-        for answer_file in answer_dir.glob("*.json"):
-            with open(answer_file, 'r', encoding='utf-8') as f:
-                data["responses"].extend(json.load(f))
-
-    # 加载分析
-    report_dir = Path("outputs/reports")
-    if report_dir.exists():
-        for report_file in report_dir.glob("*.json"):
-            with open(report_file, 'r', encoding='utf-8') as f:
-                data["analyses"].extend(json.load(f))
-
-    return data
+@st.cache_data
+def load_json(path: str):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
-def render_overview(data):
-    """渲染概览页面"""
-    st.header("📊 系统概览")
+def img_to_b64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
 
-    # 统计卡片
+
+# ──────────────────────────────────────────
+# 侧边栏：文件选择
+# ──────────────────────────────────────────
+
+st.sidebar.title("SelfPhy V2 看板")
+st.sidebar.markdown("---")
+
+# 自动扫描 outputs 目录
+results_dir = Path("outputs")
+result_files = sorted(results_dir.glob("test_result_*.json"))
+exam_files   = sorted(results_dir.glob("test_exam_v2*.json"))
+diag_files   = sorted(Path("outputs/reports").glob("diagnosis_*.json"))
+
+result_options = {f.name: str(f) for f in result_files}
+exam_options   = {f.name: str(f) for f in exam_files}
+diag_options   = {"（无）": None} | {f.name: str(f) for f in diag_files}
+
+if not result_options:
+    st.warning("未找到评测结果文件，请先运行 evaluate_runner.py")
+    st.stop()
+
+selected_result = st.sidebar.selectbox("评测结果", list(result_options.keys()))
+selected_exam   = st.sidebar.selectbox("考卷文件", list(exam_options.keys()) or ["未找到"])
+selected_diag   = st.sidebar.selectbox("诊断报告（可选）", list(diag_options.keys()))
+
+result_path = result_options[selected_result]
+exam_path   = exam_options.get(selected_exam)
+diag_path   = diag_options.get(selected_diag)
+
+result = load_json(result_path)
+exam   = load_json(exam_path) if exam_path else None
+diag   = load_json(diag_path) if diag_path else None
+
+model_name = result["model_name"]
+metrics    = result["metrics"]
+responses  = result["responses"]
+questions  = {q["question_id"]: q for q in exam["questions"]} if exam else {}
+
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"**模型**: `{model_name}`")
+st.sidebar.markdown(f"**题目数**: {metrics['total_questions']}")
+st.sidebar.markdown(f"**准确率**: {metrics['accuracy']*100:.1f}%")
+
+# ──────────────────────────────────────────
+# 主页面
+# ──────────────────────────────────────────
+
+tabs = st.tabs(["📊 总览", "📝 题目详情", "🔍 诊断报告", "🗂️ 原始数据"])
+
+# ──────── Tab 1：总览 ────────
+with tabs[0]:
+    st.header("评测总览")
+
     col1, col2, col3, col4 = st.columns(4)
+    col1.metric("总准确率", f"{metrics['accuracy']*100:.1f}%")
+    col2.metric("正确题数", f"{metrics['correct_count']} / {metrics['total_questions']}")
+    col3.metric("平均响应时间", f"{metrics['avg_response_time_ms']/1000:.1f}s")
+    col4.metric("模型", model_name)
 
-    with col1:
-        st.metric("轨迹数量", len(data["trajectories"]))
+    st.markdown("---")
 
-    with col2:
-        st.metric("考题数量", len(data["questions"]))
+    # 能力维度准确率
+    col_left, col_right = st.columns(2)
 
-    with col3:
-        st.metric("评测响应", len(data["responses"]))
+    with col_left:
+        st.subheader("能力维度准确率")
+        cap_acc = metrics.get("capability_accuracy", {})
+        if cap_acc:
+            import pandas as pd
+            df_cap = pd.DataFrame([
+                {"能力维度": k.replace("_", " ").title(), "准确率": f"{v*100:.1f}%",
+                 "得分": v}
+                for k, v in cap_acc.items()
+            ])
+            st.dataframe(
+                df_cap.style.background_gradient(subset=["得分"], cmap="RdYlGn", vmin=0, vmax=1),
+                hide_index=True, use_container_width=True
+            )
+        else:
+            st.info("无能力维度数据")
 
-    with col4:
-        st.metric("错误分析", len(data["analyses"]))
+    with col_right:
+        st.subheader("难度维度准确率")
+        diff_acc = metrics.get("difficulty_accuracy", {})
+        if diff_acc:
+            df_diff = pd.DataFrame([
+                {"难度": k.title(), "准确率": f"{v*100:.1f}%", "得分": v}
+                for k, v in diff_acc.items()
+            ])
+            st.dataframe(
+                df_diff.style.background_gradient(subset=["得分"], cmap="RdYlGn", vmin=0, vmax=1),
+                hide_index=True, use_container_width=True
+            )
+        else:
+            st.info("无难度维度数据")
 
-    # 准确率计算
-    if data["questions"] and data["responses"]:
-        total_questions = len(data["questions"])
-        total_errors = len(data["analyses"])
-        accuracy = (total_questions - total_errors) / total_questions * 100
-
-        st.subheader("总体准确率")
-        st.progress(accuracy / 100)
-        st.write(f"**{accuracy:.1f}%** ({total_questions - total_errors}/{total_questions} 正确)")
-
-    # 题型分布
-    if data["questions"]:
-        st.subheader("题型分布")
-
-        question_types = [q["question_type"] for q in data["questions"]]
-        type_counts = Counter(question_types)
-
-        fig = px.pie(
-            values=list(type_counts.values()),
-            names=list(type_counts.keys()),
-            title="Question Type Distribution"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-
-def render_trajectories(data):
-    """渲染轨迹页面"""
-    st.header("🗺️ 轨迹数据")
-
-    if not data["trajectories"]:
-        st.warning("暂无轨迹数据")
-        return
-
-    # 选择轨迹
-    traj_ids = [t["segment_id"] for t in data["trajectories"]]
-    selected_traj_id = st.selectbox("选择轨迹", traj_ids)
-
-    # 找到选中的轨迹
-    selected_traj = next(t for t in data["trajectories"] if t["segment_id"] == selected_traj_id)
-
-    # 显示轨迹信息
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("轨迹信息")
-        st.write(f"**ID**: {selected_traj['segment_id']}")
-        st.write(f"**关键帧数量**: {len(selected_traj['keyframes'])}")
-        st.write(f"**时长**: {selected_traj['end_time'] - selected_traj['start_time']:.1f} 秒")
-
-    with col2:
-        st.subheader("空间描述")
-        st.write(selected_traj["spatial_narrative"])
-
-    # 显示轨迹可视化
-    viz_path = Path(f"outputs/visualizations/{selected_traj_id}_trajectory.png")
-    if viz_path.exists():
-        st.subheader("轨迹可视化")
-        st.image(str(viz_path))
-
-    # 关键帧列表
-    st.subheader("关键帧")
-
-    for i, kf in enumerate(selected_traj["keyframes"][:5]):  # 只显示前5个
-        with st.expander(f"Frame {kf['frame_id']}"):
-            col1, col2 = st.columns([1, 2])
-
-            with col1:
-                img_path = Path(kf["image_path"])
-                if img_path.exists():
-                    st.image(str(img_path), width=300)
-
-            with col2:
-                st.write(f"**位置**: {kf['pose']['position']}")
-                st.write(f"**欧拉角**: {kf['pose']['euler_angles']}")
-                st.write(f"**动作**: {kf['pose'].get('action_label', 'N/A')}")
-
-
-def render_questions(data):
-    """渲染考题页面"""
-    st.header("📝 考题")
-
-    if not data["questions"]:
-        st.warning("暂无考题数据")
-        return
-
-    # 筛选器
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        question_types = list(set([q["question_type"] for q in data["questions"]]))
-        selected_type = st.selectbox("题型", ["全部"] + question_types)
-
-    with col2:
-        difficulties = list(set([q["difficulty"] for q in data["questions"]]))
-        selected_difficulty = st.selectbox("难度", ["全部"] + difficulties)
-
-    with col3:
-        spatial_levels = list(set([q["spatial_level"] for q in data["questions"]]))
-        selected_level = st.selectbox("空间层级", ["全部"] + spatial_levels)
-
-    # 过滤问题
-    filtered_questions = data["questions"]
-
-    if selected_type != "全部":
-        filtered_questions = [q for q in filtered_questions if q["question_type"] == selected_type]
-
-    if selected_difficulty != "全部":
-        filtered_questions = [q for q in filtered_questions if q["difficulty"] == selected_difficulty]
-
-    if selected_level != "全部":
-        filtered_questions = [q for q in filtered_questions if q["spatial_level"] == selected_level]
-
-    st.write(f"显示 {len(filtered_questions)} / {len(data['questions'])} 道题")
-
-    # 显示问题
-    for i, question in enumerate(filtered_questions[:10]):  # 只显示前10个
-        with st.expander(f"{question['question_id']} - {question['difficulty']} - {question['question_type']}"):
-            st.write("**问题**:")
-            st.write(question["prompt"])
-
-            st.write("**标准答案**:")
-            st.json(question["ground_truth"])
-
-            # 显示上下文图片
-            if question["context_frames"]:
-                st.write("**上下文图片**:")
-                cols = st.columns(len(question["context_frames"]))
-                for idx, img_path in enumerate(question["context_frames"]):
-                    if Path(img_path).exists():
-                        with cols[idx]:
-                            st.image(img_path, width=200)
-
-
-def render_analyses(data):
-    """渲染错误分析页面"""
-    st.header("🔍 错误分析")
-
-    if not data["analyses"]:
-        st.info("所有答案正确，无错误分析")
-        return
-
-    # 错误类型分布
-    st.subheader("错误类型分布")
-
-    error_types = [a["error_type"] for a in data["analyses"]]
-    type_counts = Counter(error_types)
-
-    fig = px.bar(
-        x=list(type_counts.keys()),
-        y=list(type_counts.values()),
-        labels={"x": "错误类型", "y": "数量"},
-        title="Error Type Distribution"
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # 错误详情
-    st.subheader("错误详情")
-
-    for analysis in data["analyses"][:10]:  # 只显示前10个
-        with st.expander(f"{analysis['question_id']} - {analysis['error_type']}"):
-            st.write(f"**模型**: {analysis['model_name']}")
-            st.write(f"**置信度**: {analysis['confidence']:.2f}")
-
-            st.write("**根本原因**:")
-            st.write(analysis["root_cause"])
-
-            st.write("**因果追踪**:")
-            for step in analysis["causal_trace"]:
-                st.write(f"- **{step['step_name']}** (置信度: {step['confidence']:.2f})")
-                st.write(f"  - 假设: {step['hypothesis']}")
-                st.write(f"  - 结论: {step['conclusion']}")
-
-
-def render_visualizations(data):
-    """渲染可视化页面"""
-    st.header("📈 可视化报告")
-
+    # 是否有可视化图表
+    st.markdown("---")
     viz_dir = Path("outputs/visualizations")
+    summary_img = viz_dir / "summary.png"
+    if summary_img.exists():
+        st.subheader("综合总结图")
+        st.image(str(summary_img), use_container_width=True)
+    else:
+        st.info("运行 `python core/analytics_viz.py` 生成可视化图表")
 
-    if not viz_dir.exists():
-        st.warning("暂无可视化报告")
-        return
+# ──────── Tab 2：题目详情 ────────
+with tabs[1]:
+    st.header("题目详情")
 
-    # 显示所有可视化图表
-    viz_files = list(viz_dir.glob("*.png"))
+    for i, resp in enumerate(responses):
+        qid      = resp["question_id"]
+        q        = questions.get(qid, {})
+        correct  = resp["is_correct"]
+        score    = resp.get("score", float(correct))
+        status   = "✅" if correct else "❌"
 
-    if not viz_files:
-        st.warning("暂无可视化图表")
-        return
+        with st.expander(f"{status} [{i+1}] {qid}  |  得分: {score:.2f}  |  {q.get('capability','')} · {q.get('difficulty','')}"):
+            col_q, col_a = st.columns([3, 2])
 
-    for viz_file in viz_files:
-        st.subheader(viz_file.stem.replace("_", " ").title())
-        st.image(str(viz_file))
+            with col_q:
+                st.markdown("**问题**")
+                st.write(q.get("question_text", "（考卷未加载）"))
+                st.markdown("**模型回答**")
+                st.write(resp["model_response"] or "（空）")
+                st.markdown("**标准答案**")
+                st.success(resp["ground_truth"])
+                st.markdown(f"**判定依据**: {resp.get('judge_detail','N/A')}")
+                if q.get("reasoning_trace"):
+                    with st.expander("查看 Claude 推理链"):
+                        st.write(q["reasoning_trace"])
 
+            with col_a:
+                # 显示证据帧图像
+                if exam:
+                    rgb_frames = exam["multimodal_evidence"]["rgb_frames"]
+                    eids = q.get("evidence_frame_ids", [])
+                    # 展示首/中/尾帧
+                    show_fids = []
+                    if eids:
+                        show_fids = [eids[0]]
+                        if len(eids) > 2:
+                            show_fids.append(eids[len(eids)//2])
+                        show_fids.append(eids[-1])
 
-def main():
-    """主函数"""
-    st.title("🤖 SelfPhy-Agent-System")
-    st.markdown("基于第一人称感知演化与自反思的空间推理自动化评测系统")
+                    for fid in show_fids:
+                        path = rgb_frames.get(str(fid))
+                        if path and Path(path).exists():
+                            st.image(path, caption=f"frame {fid}", use_container_width=True)
 
-    # 加载数据
-    with st.spinner("加载数据..."):
-        data = load_data()
+            st.markdown(f"**响应时间**: {resp['response_time_ms']/1000:.1f}s")
+            if resp.get("error"):
+                st.error(f"API 错误: {resp['error']}")
 
-    # 侧边栏
-    with st.sidebar:
-        st.header("导航")
-        page = st.radio(
-            "选择页面",
-            ["概览", "轨迹数据", "考题", "错误分析", "可视化报告"]
-        )
+# ──────── Tab 3：诊断报告 ────────
+with tabs[2]:
+    st.header("四步排除法诊断报告")
+
+    if not diag:
+        st.info("未加载诊断报告。先运行：\n```bash\npython core/claude_reflector.py outputs/test_result_kimi_v2_final.json outputs/test_exam_v2_precise.json data/test_v2_run/episode_000000/metadata.json\n```")
+    else:
+        # 错误类型分布
+        error_counts = Counter(d["error_type"] for d in diag)
+        st.subheader(f"错误类型分布（共 {len(diag)} 道错题）")
+
+        cols = st.columns(len(error_counts) if error_counts else 1)
+        for i, (etype, cnt) in enumerate(error_counts.most_common()):
+            cols[i].metric(etype.replace("_", " ").title(), cnt)
 
         st.markdown("---")
 
-        st.subheader("系统信息")
-        st.write(f"轨迹: {len(data['trajectories'])}")
-        st.write(f"考题: {len(data['questions'])}")
-        st.write(f"响应: {len(data['responses'])}")
-        st.write(f"分析: {len(data['analyses'])}")
+        for d in diag:
+            with st.expander(f"🔍 {d['question_id']}  |  {d['error_type']}  |  置信度 {d['confidence']:.0%}"):
+                st.markdown(f"**根因解释**: {d['root_cause_explanation']}")
 
-    # 渲染选中的页面
-    if page == "概览":
-        render_overview(data)
-    elif page == "轨迹数据":
-        render_trajectories(data)
-    elif page == "考题":
-        render_questions(data)
-    elif page == "错误分析":
-        render_analyses(data)
-    elif page == "可视化报告":
-        render_visualizations(data)
+                diag_steps = d.get("diagnosis", {})
+                if isinstance(diag_steps, dict) and "step1_physical_check" in diag_steps:
+                    step1 = diag_steps["step1_physical_check"]
+                    step2 = diag_steps.get("step2_spatial_reconstruction", {})
+                    step3 = diag_steps.get("step3_fov_check", {})
+                    step4 = diag_steps.get("step4_root_cause", {})
 
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**Step 1 - 物理-语义对齐**")
+                        st.json(step1)
+                        st.markdown("**Step 2 - 空间位置重塑**")
+                        st.json(step2)
+                    with col2:
+                        st.markdown("**Step 3 - 视场边界校验**")
+                        st.json(step3)
+                        st.markdown("**Step 4 - 根因归纳**")
+                        st.json(step4)
+                else:
+                    st.json(diag_steps)
 
-if __name__ == "__main__":
-    main()
+# ──────── Tab 4：原始数据 ────────
+with tabs[3]:
+    st.header("原始数据浏览")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("评测结果 JSON")
+        st.json(result)
+    with col2:
+        st.subheader("考卷 JSON")
+        if exam:
+            # 不展示 base64 图像内容
+            exam_display = json.loads(json.dumps(exam))
+            for fid in list(exam_display["multimodal_evidence"].get("rgb_frames", {}).keys()):
+                exam_display["multimodal_evidence"]["rgb_frames"][fid] = "<path>"
+            st.json(exam_display)
+        else:
+            st.info("未加载考卷")

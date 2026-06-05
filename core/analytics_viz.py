@@ -1,416 +1,365 @@
 """
-可视化分析层 (Analytics Visualizer)
-负责生成雷达图、饼图、热力图等可视化报告
+analytics_viz.py
+-------------------
+可视化层 V2：读取 EvaluationResultV2 + 诊断报告，生成论文级图表
+
+支持图表：
+1. 5 维能力雷达图（多模型对比）
+2. 错误类型分布饼图
+3. 难度-准确率柱状图
+4. 响应时间箱线图
+5. 综合总结图（2×2 拼图）
 """
 
 import json
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-from collections import Counter
 import matplotlib
+matplotlib.use("Agg")  # 无显示器环境
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from pathlib import Path
+from typing import List, Dict, Optional
+from collections import Counter
 
-# 设置中文字体支持
-matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
-matplotlib.rcParams['axes.unicode_minus'] = False
+
+# 5 个能力维度（固定顺序，保证雷达图可比）
+CAPABILITIES = [
+    "egocentric_memory",
+    "spatial_transformation",
+    "occlusion_reasoning",
+    "trajectory_backtracking",
+    "distance_estimation",
+]
+CAP_LABELS = [
+    "Egocentric\nMemory",
+    "Spatial\nTransform",
+    "Occlusion\nReason",
+    "Trajectory\nBacktrack",
+    "Distance\nEstim.",
+]
+
+# 错误类型（来自 claude_reflector_v2）
+ERROR_TYPES = [
+    "direction_calc_error",
+    "rotation_sense_error",
+    "rotation_translation_confusion",
+    "memory_decay",
+    "object_hallucination",
+    "fov_misunderstanding",
+]
+ERROR_LABELS = [
+    "Direction Calc",
+    "Rotation Sense",
+    "Rot-Trans Confusion",
+    "Memory Decay",
+    "Hallucination",
+    "FOV Misunderstand",
+]
+
+COLORS = ["#E74C3C", "#3498DB", "#2ECC71", "#F39C12", "#9B59B6", "#1ABC9C"]
 
 
-class AnalyticsVisualizer:
-    """可视化分析层"""
+class AnalyticsVizV2:
 
     def __init__(self, output_dir: str = "outputs/visualizations"):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.out = Path(output_dir)
+        self.out.mkdir(parents=True, exist_ok=True)
 
-    def generate_radar_chart(
+    # ──────────────────────────────────────────
+    # 数据加载
+    # ──────────────────────────────────────────
+
+    def load_result(self, result_path: str) -> Dict:
+        with open(result_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def load_diagnosis(self, diagnosis_path: str) -> List[Dict]:
+        with open(diagnosis_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _cap_accuracy(self, result: Dict) -> Dict[str, float]:
+        """从 EvaluationResultV2 提取各能力维度准确率"""
+        return result["metrics"].get("capability_accuracy", {})
+
+    # ──────────────────────────────────────────
+    # 图 1：能力雷达图
+    # ──────────────────────────────────────────
+
+    def radar_chart(
         self,
-        analyses_paths: Dict[str, str],
+        results: Dict[str, Dict],   # {model_name: result_dict}
         output_filename: str = "radar_chart.png"
     ) -> str:
-        """
-        生成雷达图（各维度错误率对比）
-
-        Args:
-            analyses_paths: {model_name: analysis_file_path}
-            output_filename: 输出文件名
-
-        Returns:
-            图片保存路径
-        """
-        # 错误类型维度
-        error_dimensions = [
-            "physical_misalignment",
-            "spatial_topology_error",
-            "fov_boundary_issue",
-            "memory_decay",
-            "object_hallucination",
-            "occlusion_misunderstanding"
-        ]
-
-        dimension_labels = [
-            "Physical\nMisalignment",
-            "Spatial\nTopology",
-            "FOV\nBoundary",
-            "Memory\nDecay",
-            "Object\nHallucination",
-            "Occlusion\nMisunderstanding"
-        ]
-
-        # 收集每个模型的错误分布
-        model_data = {}
-
-        for model_name, analysis_path in analyses_paths.items():
-            with open(analysis_path, 'r', encoding='utf-8') as f:
-                analyses = json.load(f)
-
-            # 统计错误类型
-            error_counts = Counter([a['error_type'] for a in analyses])
-            total = len(analyses) if analyses else 1
-
-            # 计算每个维度的错误率
-            error_rates = [error_counts.get(dim, 0) / total for dim in error_dimensions]
-            model_data[model_name] = error_rates
-
-        # 绘制雷达图
-        fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection='polar'))
-
-        # 角度
-        angles = np.linspace(0, 2 * np.pi, len(error_dimensions), endpoint=False).tolist()
+        n = len(CAPABILITIES)
+        angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
         angles += angles[:1]  # 闭合
 
-        # 绘制每个模型
-        colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8']
-        for i, (model_name, error_rates) in enumerate(model_data.items()):
-            values = error_rates + error_rates[:1]  # 闭合
-            ax.plot(angles, values, 'o-', linewidth=2, label=model_name, color=colors[i % len(colors)])
-            ax.fill(angles, values, alpha=0.15, color=colors[i % len(colors)])
-
-        # 设置标签
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(projection="polar"))
+        ax.set_theta_offset(np.pi / 2)
+        ax.set_theta_direction(-1)
         ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(dimension_labels, size=10)
+        ax.set_xticklabels(CAP_LABELS, size=10)
         ax.set_ylim(0, 1)
         ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
-        ax.set_yticklabels(['20%', '40%', '60%', '80%', '100%'])
-        ax.grid(True)
+        ax.set_yticklabels(["20%", "40%", "60%", "80%", "100%"], size=8)
+        ax.grid(color="grey", linestyle="--", linewidth=0.5, alpha=0.7)
 
-        plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
-        plt.title('Error Type Distribution by Model', size=16, pad=20)
+        for i, (model_name, result) in enumerate(results.items()):
+            cap_acc = self._cap_accuracy(result)
+            values = [cap_acc.get(c, 0.0) for c in CAPABILITIES]
+            values += values[:1]
+            color = COLORS[i % len(COLORS)]
+            ax.plot(angles, values, "o-", linewidth=2, color=color, label=model_name)
+            ax.fill(angles, values, alpha=0.15, color=color)
 
-        output_path = self.output_dir / output_filename
+        ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=10)
+        ax.set_title("Capability Accuracy Radar\n(V2 Embodied Spatial Evaluation)", pad=20, fontsize=13)
+
+        out_path = str(self.out / output_filename)
         plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close()
+        print(f"  雷达图: {out_path}")
+        return out_path
 
-        print(f"[Saved] Radar chart: {output_path}")
-        return str(output_path)
+    # ──────────────────────────────────────────
+    # 图 2：错误类型分布饼图
+    # ──────────────────────────────────────────
 
-    def generate_forgetting_curve(
+    def error_pie(
         self,
-        analyses_path: str,
-        questions_path: str,
-        output_filename: str = "forgetting_curve.png"
+        diagnoses: Dict[str, List[Dict]],   # {model_name: diagnosis_list}
+        output_filename: str = "error_pie.png"
     ) -> str:
+        n_models = len(diagnoses)
+        fig, axes = plt.subplots(1, n_models, figsize=(6 * n_models, 6))
+        if n_models == 1:
+            axes = [axes]
+
+        for ax, (model_name, diag_list) in zip(axes, diagnoses.items()):
+            counts = Counter(d["error_type"] for d in diag_list)
+            labels, sizes, colors = [], [], []
+            for etype, elabel, color in zip(ERROR_TYPES, ERROR_LABELS, COLORS):
+                cnt = counts.get(etype, 0)
+                if cnt > 0:
+                    labels.append(f"{elabel}\n({cnt})")
+                    sizes.append(cnt)
+                    colors.append(color)
+
+            if sizes:
+                ax.pie(sizes, labels=labels, colors=colors, autopct="%1.0f%%",
+                       startangle=90, textprops={"fontsize": 9})
+            else:
+                ax.text(0.5, 0.5, "No errors", ha="center", va="center")
+
+            ax.set_title(f"{model_name}\nError Type Distribution", fontsize=12)
+
+        out_path = str(self.out / output_filename)
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  错误类型饼图: {out_path}")
+        return out_path
+
+    # ──────────────────────────────────────────
+    # 图 3：难度-准确率柱状图
+    # ──────────────────────────────────────────
+
+    def difficulty_bar(
+        self,
+        results: Dict[str, Dict],
+        output_filename: str = "difficulty_accuracy.png"
+    ) -> str:
+        difficulties = ["easy", "medium", "hard"]
+        x = np.arange(len(difficulties))
+        width = 0.8 / max(len(results), 1)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        for i, (model_name, result) in enumerate(results.items()):
+            diff_acc = result["metrics"].get("difficulty_accuracy", {})
+            vals = [diff_acc.get(d, 0.0) * 100 for d in difficulties]
+            offset = (i - len(results) / 2 + 0.5) * width
+            bars = ax.bar(x + offset, vals, width * 0.9,
+                          label=model_name, color=COLORS[i % len(COLORS)], alpha=0.85)
+            for bar, val in zip(bars, vals):
+                if val > 0:
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                            f"{val:.0f}%", ha="center", va="bottom", fontsize=9)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(["Easy", "Medium", "Hard"], fontsize=11)
+        ax.set_ylabel("Accuracy (%)", fontsize=11)
+        ax.set_ylim(0, 110)
+        ax.axhline(y=50, color="grey", linestyle="--", alpha=0.5, label="50% baseline")
+        ax.legend(fontsize=10)
+        ax.set_title("Accuracy by Difficulty Level", fontsize=13)
+        ax.grid(axis="y", alpha=0.3)
+
+        out_path = str(self.out / output_filename)
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  难度柱状图: {out_path}")
+        return out_path
+
+    # ──────────────────────────────────────────
+    # 图 4：综合总结图（2×2）
+    # ──────────────────────────────────────────
+
+    def summary_figure(
+        self,
+        results: Dict[str, Dict],
+        diagnoses: Optional[Dict[str, List[Dict]]] = None,
+        output_filename: str = "summary.png"
+    ) -> str:
+        fig = plt.figure(figsize=(16, 12))
+        fig.suptitle("SelfPhy-Agent-System V2 — Evaluation Summary", fontsize=16, fontweight="bold")
+
+        # 子图 1（左上）：总体准确率横向条形图
+        ax1 = fig.add_subplot(2, 2, 1)
+        model_names = list(results.keys())
+        accuracies = [results[m]["metrics"]["accuracy"] * 100 for m in model_names]
+        bars = ax1.barh(model_names, accuracies,
+                        color=[COLORS[i % len(COLORS)] for i in range(len(model_names))],
+                        alpha=0.85, height=0.5)
+        for bar, acc in zip(bars, accuracies):
+            ax1.text(bar.get_width() + 1, bar.get_y() + bar.get_height() / 2,
+                     f"{acc:.1f}%", va="center", fontsize=11)
+        ax1.set_xlim(0, 115)
+        ax1.set_xlabel("Overall Accuracy (%)")
+        ax1.set_title("Overall Accuracy")
+        ax1.axvline(x=50, color="grey", linestyle="--", alpha=0.5)
+
+        # 子图 2（右上）：能力维度热力图
+        ax2 = fig.add_subplot(2, 2, 2)
+        cap_matrix = []
+        for m in model_names:
+            cap_acc = results[m]["metrics"].get("capability_accuracy", {})
+            row = [cap_acc.get(c, 0.0) * 100 for c in CAPABILITIES]
+            cap_matrix.append(row)
+        cap_matrix = np.array(cap_matrix) if cap_matrix else np.zeros((1, len(CAPABILITIES)))
+        im = ax2.imshow(cap_matrix, cmap="RdYlGn", vmin=0, vmax=100, aspect="auto")
+        ax2.set_xticks(range(len(CAPABILITIES)))
+        ax2.set_xticklabels(CAP_LABELS, fontsize=8, rotation=20, ha="right")
+        ax2.set_yticks(range(len(model_names)))
+        ax2.set_yticklabels(model_names, fontsize=10)
+        for i in range(len(model_names)):
+            for j in range(len(CAPABILITIES)):
+                ax2.text(j, i, f"{cap_matrix[i, j]:.0f}%",
+                         ha="center", va="center", fontsize=9,
+                         color="black" if cap_matrix[i, j] > 40 else "white")
+        fig.colorbar(im, ax=ax2, shrink=0.8)
+        ax2.set_title("Capability Accuracy Heatmap (%)")
+
+        # 子图 3（左下）：难度-准确率
+        ax3 = fig.add_subplot(2, 2, 3)
+        difficulties = ["easy", "medium", "hard"]
+        x = np.arange(len(difficulties))
+        width = 0.8 / max(len(results), 1)
+        for i, (m, result) in enumerate(results.items()):
+            diff_acc = result["metrics"].get("difficulty_accuracy", {})
+            vals = [diff_acc.get(d, 0.0) * 100 for d in difficulties]
+            offset = (i - len(results) / 2 + 0.5) * width
+            ax3.bar(x + offset, vals, width * 0.9,
+                    label=m, color=COLORS[i % len(COLORS)], alpha=0.85)
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(["Easy", "Medium", "Hard"])
+        ax3.set_ylabel("Accuracy (%)")
+        ax3.set_ylim(0, 110)
+        ax3.legend(fontsize=9)
+        ax3.set_title("Accuracy by Difficulty")
+        ax3.grid(axis="y", alpha=0.3)
+
+        # 子图 4（右下）：错误类型分布（若有诊断报告）
+        ax4 = fig.add_subplot(2, 2, 4)
+        if diagnoses:
+            all_errors = []
+            for diag_list in diagnoses.values():
+                all_errors.extend(d["error_type"] for d in diag_list)
+            counts = Counter(all_errors)
+            labels_used = [(ERROR_LABELS[i], counts.get(et, 0), COLORS[i])
+                           for i, et in enumerate(ERROR_TYPES) if counts.get(et, 0) > 0]
+            if labels_used:
+                labels_txt, sizes, pie_colors = zip(*labels_used)
+                ax4.pie(sizes, labels=labels_txt, colors=pie_colors,
+                        autopct="%1.0f%%", startangle=90, textprops={"fontsize": 8})
+                ax4.set_title("Error Type Distribution (All Models)")
+            else:
+                ax4.text(0.5, 0.5, "No errors diagnosed", ha="center", va="center")
+                ax4.set_title("Error Type Distribution")
+        else:
+            ax4.text(0.5, 0.5, "Run claude_reflector_v2\nfor diagnosis", ha="center", va="center", fontsize=10)
+            ax4.set_title("Error Type Distribution")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        out_path = str(self.out / output_filename)
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  综合总结图: {out_path}")
+        return out_path
+
+    # ──────────────────────────────────────────
+    # 一键生成全部图表
+    # ──────────────────────────────────────────
+
+    def generate_all(
+        self,
+        result_paths: Dict[str, str],       # {model_name: result_json_path}
+        diagnosis_paths: Dict[str, str] = None  # {model_name: diagnosis_json_path}
+    ) -> Dict[str, str]:
         """
-        生成遗忘曲线（时间间隔 vs 准确率）
+        一键生成所有图表。
 
         Args:
-            analyses_path: 错误分析文件路径
-            questions_path: 问题文件路径
-            output_filename: 输出文件名
+            result_paths:    各模型的评测结果路径
+            diagnosis_paths: 各模型的诊断报告路径（可选）
 
         Returns:
-            图片保存路径
+            生成的图表路径字典
         """
-        # 加载数据
-        with open(analyses_path, 'r', encoding='utf-8') as f:
-            analyses = json.load(f)
+        print("\n[Analytics V2] 开始生成可视化图表...")
 
-        with open(questions_path, 'r', encoding='utf-8') as f:
-            questions = json.load(f)
+        results   = {m: self.load_result(p) for m, p in result_paths.items()}
+        diagnoses = None
+        if diagnosis_paths:
+            diagnoses = {m: self.load_diagnosis(p) for m, p in diagnosis_paths.items()
+                         if Path(p).exists()}
 
-        # 构建问题字典
-        questions_dict = {q['question_id']: q for q in questions}
+        generated = {}
+        generated["radar"]      = self.radar_chart(results)
+        generated["difficulty"] = self.difficulty_bar(results)
+        generated["summary"]    = self.summary_figure(results, diagnoses)
+        if diagnoses:
+            generated["error_pie"] = self.error_pie(diagnoses)
 
-        # 收集时间间隔和错误率
-        time_gaps = []
-        for analysis in analyses:
-            question = questions_dict.get(analysis['question_id'])
-            if question and question.get('time_gap') is not None:
-                time_gaps.append(question['time_gap'])
-
-        # 统计每个时间间隔的错误数
-        if not time_gaps:
-            print("[Warning] No time gap data available")
-            return ""
-
-        # 分桶统计
-        max_gap = max(time_gaps)
-        bins = np.linspace(0, max_gap, 10)
-        bin_errors = np.histogram(time_gaps, bins=bins)[0]
-
-        # 计算总问题数（假设均匀分布）
-        total_questions = len(questions)
-        bin_totals = [total_questions // len(bins)] * len(bins)
-
-        # 计算错误率
-        error_rates = [errors / max(total, 1) for errors, total in zip(bin_errors, bin_totals)]
-
-        # 绘制曲线
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        bin_centers = (bins[:-1] + bins[1:]) / 2
-        ax.plot(bin_centers, error_rates, 'o-', linewidth=2, markersize=8, color='#FF6B6B')
-        ax.fill_between(bin_centers, error_rates, alpha=0.3, color='#FF6B6B')
-
-        ax.set_xlabel('Time Gap (frames)', fontsize=12)
-        ax.set_ylabel('Error Rate', fontsize=12)
-        ax.set_title('Spatial Memory Forgetting Curve', fontsize=14)
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(0, 1)
-
-        output_path = self.output_dir / output_filename
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150)
-        plt.close()
-
-        print(f"[Saved] Forgetting curve: {output_path}")
-        return str(output_path)
-
-    def generate_heatmap(
-        self,
-        analyses_path: str,
-        questions_path: str,
-        output_filename: str = "heatmap.png"
-    ) -> str:
-        """
-        生成热力图（空间层级 vs 时间间隔）
-
-        Args:
-            analyses_path: 错误分析文件路径
-            questions_path: 问题文件路径
-            output_filename: 输出文件名
-
-        Returns:
-            图片保存路径
-        """
-        # 加载数据
-        with open(analyses_path, 'r', encoding='utf-8') as f:
-            analyses = json.load(f)
-
-        with open(questions_path, 'r', encoding='utf-8') as f:
-            questions = json.load(f)
-
-        # 构建问题字典
-        questions_dict = {q['question_id']: q for q in questions}
-
-        # 空间层级
-        spatial_levels = ["room", "area", "object", "attribute"]
-
-        # 时间间隔分桶
-        time_bins = [(0, 2), (2, 5), (5, 10), (10, float('inf'))]
-        time_labels = ["0-2", "2-5", "5-10", "10+"]
-
-        # 构建矩阵
-        matrix = np.zeros((len(spatial_levels), len(time_bins)))
-
-        for analysis in analyses:
-            question = questions_dict.get(analysis['question_id'])
-            if not question:
-                continue
-
-            spatial_level = question.get('spatial_level')
-            time_gap = question.get('time_gap', 0)
-
-            if spatial_level in spatial_levels:
-                level_idx = spatial_levels.index(spatial_level)
-
-                # 找到时间桶
-                for bin_idx, (low, high) in enumerate(time_bins):
-                    if low <= time_gap < high:
-                        matrix[level_idx, bin_idx] += 1
-                        break
-
-        # 归一化（转换为错误率）
-        # 这里简化处理，实际应该除以每个格子的总问题数
-        matrix = matrix / (matrix.sum() + 1e-6)
-
-        # 绘制热力图
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        sns.heatmap(
-            matrix,
-            annot=True,
-            fmt='.2%',
-            cmap='YlOrRd',
-            xticklabels=time_labels,
-            yticklabels=spatial_levels,
-            cbar_kws={'label': 'Error Rate'},
-            ax=ax
-        )
-
-        ax.set_xlabel('Time Gap (frames)', fontsize=12)
-        ax.set_ylabel('Spatial Level', fontsize=12)
-        ax.set_title('Error Distribution: Spatial Level vs Time Gap', fontsize=14)
-
-        output_path = self.output_dir / output_filename
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150)
-        plt.close()
-
-        print(f"[Saved] Heatmap: {output_path}")
-        return str(output_path)
-
-    def generate_summary_report(
-        self,
-        analyses_paths: Dict[str, str],
-        questions_path: str,
-        output_filename: str = "summary_report.png"
-    ) -> str:
-        """
-        生成综合报告（多子图）
-
-        Args:
-            analyses_paths: {model_name: analysis_file_path}
-            questions_path: 问题文件路径
-            output_filename: 输出文件名
-
-        Returns:
-            图片保存路径
-        """
-        fig = plt.figure(figsize=(16, 10))
-
-        # 子图1: 总体准确率对比
-        ax1 = plt.subplot(2, 3, 1)
-        model_names = []
-        accuracy_rates = []
-
-        with open(questions_path, 'r', encoding='utf-8') as f:
-            questions = json.load(f)
-        total_questions = len(questions)
-
-        for model_name, analysis_path in analyses_paths.items():
-            with open(analysis_path, 'r', encoding='utf-8') as f:
-                analyses = json.load(f)
-
-            error_count = len(analyses)
-            accuracy = (total_questions - error_count) / total_questions if total_questions > 0 else 0
-
-            model_names.append(model_name)
-            accuracy_rates.append(accuracy)
-
-        ax1.bar(model_names, accuracy_rates, color=['#4ECDC4', '#FF6B6B', '#45B7D1'])
-        ax1.set_ylabel('Accuracy', fontsize=10)
-        ax1.set_title('Overall Accuracy by Model', fontsize=12)
-        ax1.set_ylim(0, 1)
-        ax1.grid(axis='y', alpha=0.3)
-
-        # 子图2: 错误类型分布（饼图）
-        ax2 = plt.subplot(2, 3, 2)
-        all_errors = []
-        for analysis_path in analyses_paths.values():
-            with open(analysis_path, 'r', encoding='utf-8') as f:
-                analyses = json.load(f)
-            all_errors.extend([a['error_type'] for a in analyses])
-
-        error_counts = Counter(all_errors)
-        ax2.pie(
-            error_counts.values(),
-            labels=[e.replace('_', '\n') for e in error_counts.keys()],
-            autopct='%1.1f%%',
-            startangle=90
-        )
-        ax2.set_title('Error Type Distribution', fontsize=12)
-
-        # 子图3: 难度分布
-        ax3 = plt.subplot(2, 3, 3)
-        difficulties = [q['difficulty'] for q in questions]
-        difficulty_counts = Counter(difficulties)
-        ax3.bar(difficulty_counts.keys(), difficulty_counts.values(), color=['#90EE90', '#FFD700', '#FF6347'])
-        ax3.set_ylabel('Count', fontsize=10)
-        ax3.set_title('Question Difficulty Distribution', fontsize=12)
-        ax3.grid(axis='y', alpha=0.3)
-
-        # 子图4-6: 每个模型的错误类型分布
-        for idx, (model_name, analysis_path) in enumerate(analyses_paths.items()):
-            if idx >= 3:
-                break
-
-            ax = plt.subplot(2, 3, 4 + idx)
-
-            with open(analysis_path, 'r', encoding='utf-8') as f:
-                analyses = json.load(f)
-
-            error_counts = Counter([a['error_type'] for a in analyses])
-
-            ax.barh(
-                list(error_counts.keys()),
-                list(error_counts.values()),
-                color='#4ECDC4'
-            )
-            ax.set_xlabel('Count', fontsize=10)
-            ax.set_title(f'{model_name} Error Types', fontsize=12)
-            ax.grid(axis='x', alpha=0.3)
-
-        plt.tight_layout()
-
-        output_path = self.output_dir / output_filename
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        print(f"[Saved] Summary report: {output_path}")
-        return str(output_path)
+        print(f"\n✅ 共生成 {len(generated)} 张图表，保存在: {self.out}")
+        return generated
 
 
 def main():
-    """主函数：生成可视化报告"""
-    visualizer = AnalyticsVisualizer()
+    import argparse, glob
 
-    # 示例路径
-    analyses_paths = {
-        "gpt-4o-mini": "outputs/reports/error_analysis_20260526_120000.json"
-    }
-    questions_path = "outputs/exams/exam_episode_001.json"
+    parser = argparse.ArgumentParser(description="Analytics Viz V2")
+    parser.add_argument("--results",   nargs="+", help="模型结果文件：model_name:path ...")
+    parser.add_argument("--diagnoses", nargs="*", help="诊断文件：model_name:path ...")
+    parser.add_argument("--output-dir", default="outputs/visualizations")
+    args = parser.parse_args()
 
-    # 检查文件是否存在
-    for path in list(analyses_paths.values()) + [questions_path]:
-        if not Path(path).exists():
-            print(f"[Error] File not found: {path}")
-            print("Please run the previous steps first.")
-            return
+    result_paths = {}
+    if args.results:
+        for item in args.results:
+            name, path = item.split(":", 1)
+            result_paths[name] = path
 
-    try:
-        # 生成雷达图
-        visualizer.generate_radar_chart(analyses_paths, "radar_chart.png")
+    diagnosis_paths = {}
+    if args.diagnoses:
+        for item in args.diagnoses:
+            name, path = item.split(":", 1)
+            diagnosis_paths[name] = path
 
-        # 生成遗忘曲线
-        visualizer.generate_forgetting_curve(
-            analyses_paths["gpt-4o-mini"],
-            questions_path,
-            "forgetting_curve.png"
-        )
-
-        # 生成热力图
-        visualizer.generate_heatmap(
-            analyses_paths["gpt-4o-mini"],
-            questions_path,
-            "heatmap.png"
-        )
-
-        # 生成综合报告
-        visualizer.generate_summary_report(
-            analyses_paths,
-            questions_path,
-            "summary_report.png"
-        )
-
-        print("\n[Success] All visualizations generated!")
-
-    except Exception as e:
-        print(f"[Error] Visualization failed: {e}")
-        import traceback
-        traceback.print_exc()
+    viz = AnalyticsVizV2(output_dir=args.output_dir)
+    viz.generate_all(result_paths, diagnosis_paths or None)
 
 
 if __name__ == "__main__":

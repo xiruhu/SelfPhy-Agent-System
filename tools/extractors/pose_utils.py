@@ -8,17 +8,44 @@ import numpy as np
 from typing import List, Tuple
 
 
-def pose_matrix_to_position_rotation(pose_matrix: List[List[float]]) -> Tuple[List[float], List[List[float]]]:
+def pose_matrix_to_position_rotation(pose_matrix) -> Tuple[List[float], List[List[float]]]:
     """
     从 4x4 pose matrix 提取 position 和 3x3 rotation matrix
 
     Args:
-        pose_matrix: 4x4 transformation matrix
+        pose_matrix: 4x4 transformation matrix (可能是嵌套列表、numpy数组列表等)
 
     Returns:
         (position [x, y, z], rotation [[r00, r01, r02], [r10, r11, r12], [r20, r21, r22]])
     """
-    pose = np.array(pose_matrix)
+    # 处理多种可能的输入格式
+    if isinstance(pose_matrix, np.ndarray):
+        # 如果已经是 numpy 数组
+        if pose_matrix.dtype == object:
+            # 如果是 object 类型（嵌套的 numpy 数组），需要手动堆叠
+            pose = np.vstack([np.array(row).flatten() for row in pose_matrix]).reshape(4, 4)
+        else:
+            pose = pose_matrix
+    elif isinstance(pose_matrix, list):
+        # 如果是列表，检查元素类型
+        if len(pose_matrix) > 0 and isinstance(pose_matrix[0], np.ndarray):
+            # 列表中包含 numpy 数组，需要堆叠
+            pose = np.vstack([row.flatten() for row in pose_matrix]).reshape(4, 4)
+        else:
+            # 普通嵌套列表
+            pose = np.array(pose_matrix)
+    else:
+        pose = np.array(pose_matrix)
+
+    # 确保是 2D 数组
+    if pose.ndim == 1:
+        if len(pose) == 16:
+            pose = pose.reshape(4, 4)
+        else:
+            raise ValueError(f"Unexpected pose shape: {pose.shape}, cannot reshape to 4x4")
+
+    if pose.shape != (4, 4):
+        raise ValueError(f"Expected 4x4 matrix, got shape {pose.shape}")
 
     # 提取平移向量 (最后一列的前三行)
     position = pose[:3, 3].tolist()
