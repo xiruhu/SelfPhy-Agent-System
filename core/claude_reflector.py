@@ -1,16 +1,17 @@
 """
 claude_reflector.py
 ----------------------
-四步排除法错题诊断系统 V2
+三步排除法错题诊断系统 V2
 
 输入：EvaluationResultV2（模型评测结果）+ ExamPaperV2（考卷含真实轨迹）
 输出：每道错题的 ErrorAnalysisV2（证据链 + 根因分类）
 
-四步排除法：
+三步排除法：
   Step 1: 物理-语义对齐检查  — 模型说的方向是否物理上可能？
   Step 2: 空间位置重塑验证  — 基于精确位姿，反算正确答案，量化偏差
-  Step 3: 视场边界校验      — 物体是否在视野范围内？是否被遮挡？
-  Step 4: 根因分类归纳      — 综合前三步，输出结构化根因
+  Step 3: 根因分类归纳      — 综合前两步，输出结构化根因
+
+注：待测模型接收全部帧，FOV 可见性不再作为排除条件。
 
 长官模型：claude-sonnet-4-6（只有它才接受多模态输入 + 执行推理）
 """
@@ -77,7 +78,7 @@ def analyze_one_error(
     traj_data: List[Dict]
 ) -> Dict:
     """
-    对单道错题执行四步排除法。
+    对单道错题执行三步排除法。
 
     Args:
         question:      exam_v2.json 中的题目字典
@@ -138,7 +139,7 @@ def analyze_one_error(
 ## 精确位姿轨迹（证据帧范围内）
 {traj_lines}
 
-## 你的任务：执行四步排除法
+## 你的任务：执行三步排除法
 
 **Step 1 - 物理-语义对齐检查**
 模型的回答在语义上是否符合场景的物理约束？是否描述了不可能存在的物体或方向？
@@ -151,10 +152,7 @@ def analyze_one_error(
 - 若物体初始在方向 θ₀，则终止时相对方向 = θ₀ - cum_yaw_delta（规范化到 [-180°, 180°]）
 写出完整的数值推导过程，与模型回答对比，量化偏差。
 
-**Step 3 - 视场边界校验**
-根据图像帧和位姿，判断：目标物体在关键帧时是否在视野内（默认 FOV=90°）？是否被遮挡？
-
-**Step 4 - 根因分类**
+**Step 3 - 根因分类**
 从以下类型中选一个最匹配的根因：
 {json.dumps({e.value: h for e, h in _ERROR_HINTS.items()}, ensure_ascii=False, indent=2)}
 
@@ -172,12 +170,7 @@ def analyze_one_error(
     "correct_answer_calc": "推导过程",
     "model_answer_deviation": "偏差描述"
   }},
-  "step3_fov_check": {{
-    "object_in_fov": true或false,
-    "occlusion_ratio": 0到1,
-    "conclusion": "描述"
-  }},
-  "step4_root_cause": {{
+  "step3_root_cause": {{
     "error_type": "错误类型枚举值",
     "confidence": 0到1,
     "explanation": "解释"
@@ -186,23 +179,55 @@ def analyze_one_error(
 
     content = [{"type": "text", "text": prompt}] + image_blocks
 
-    try:
-        resp = client.messages.create(
-            model=SUPERVISOR_MODEL,
-            max_tokens=2000,
-            messages=[{"role": "user", "content": content}]
-        )
-        raw = resp.content[0].text.strip()
+    import time as _time
+    import re as _re
 
-        # 解析 JSON
-        import re
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
-        diagnosis = json.loads(m.group(0)) if m else {"raw": raw}
+    diagnosis = {"raw": ""}
+    for _attempt in range(3):
+        try:
+            resp = client.messages.create(
+                model=SUPERVISOR_MODEL,
+                max_tokens=2000,
+                messages=[{"role": "user", "content": content}]
+            )
+            # 用 .type == "text" 精确匹配 TextBlock，跳过 ThinkingBlock
+            raw_block = next((b for b in resp.content if getattr(b, "type", None) == "text"), None)
+            raw = raw_block.text.strip() if raw_block else ""
 
-    except Exception as e:
-        diagnosis = {"error": str(e)}
+            if not raw:
+                if _attempt < 2:
+                    _time.sleep(3)
+                    continue
+                break
 
-    root_cause = diagnosis.get("step4_root_cause", {})
+            # 解析 JSON（中文引号替换 + 括号匹配）
+            raw = _re.sub(r"```[a-z]*\n?", "", raw)
+            raw = _re.sub(r"```", "", raw).strip()
+            raw_clean = raw.replace(""", '"').replace(""", '"').replace("'", "'").replace("'", "'")
+            start = raw_clean.find('{')
+            if start != -1:
+                depth, end = 0, start
+                for i, ch in enumerate(raw_clean[start:], start):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+                try:
+                    diagnosis = json.loads(raw_clean[start:end + 1])
+                except json.JSONDecodeError:
+                    diagnosis = {"raw": raw}
+            else:
+                diagnosis = {"raw": raw}
+            break
+
+        except Exception as e:
+            diagnosis = {"error": str(e)}
+            break
+
+    root_cause = diagnosis.get("step3_root_cause", {})
 
     return {
         "question_id": q_id,
@@ -226,7 +251,7 @@ def run_reflector_v2(
     output_path: str = None
 ) -> List[Dict]:
     """
-    对评测结果中所有错题执行四步排除法诊断。
+    对评测结果中所有错题执行三步排除法诊断。
 
     Args:
         result_path:   test_result_kimi_v2_final.json
@@ -290,7 +315,7 @@ def run_reflector_v2(
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Claude Reflector V2 - 四步排除法错题诊断")
+    parser = argparse.ArgumentParser(description="Claude Reflector V2 - 三步排除法错题诊断")
     parser.add_argument("result",   help="EvaluationResultV2 JSON 路径")
     parser.add_argument("exam",     help="ExamPaperV2 JSON 路径")
     parser.add_argument("metadata", help="metadata.json 路径")

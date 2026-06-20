@@ -1,8 +1,8 @@
 # SelfPhy-Agent-System
 
-**基于第一人称感知演化与自反思的空间推理自动化评测系统**
+**基于第一人称感知的多模态大模型空间推理自动化评测系统**
 
-> 系统化评测大模型在第一人称动态物理世界中的空间记忆与推理能力（Egocentric Spatial Recall）
+> 系统化评测多模态大模型在第一人称动态物理世界中的空间记忆与推理能力（Egocentric Spatial Reasoning）
 
 ---
 
@@ -10,63 +10,68 @@
 
 现有多模态大模型 Benchmark 大多基于静态第三人称视角，缺乏对第一人称连续运动中"物体遮挡、视场盲区、空间回溯"的深度考核。SelfPhy-Agent-System 填补这一学术空白，构建了一套完整的自动化闭环评测流水线。
 
-系统同时扮演四个角色：
-- **自动化出题平台**：基于 Habitat 6-DoF 轨迹数据自动生成空间推理考题
-- **自动化监考平台**：统一派发考题给多个被测大模型并收集回答
-- **错误诊断平台**：通过四步排除法 + RAG 知识库进行根因分析
-- **可视化分析平台**：雷达图、遗忘曲线、热力图等多维度看板
+**核心设计原则**：被测模型只能看到连续帧图像序列，不接收任何场景文字描述，必须通过"看视频"来推断空间关系。这真正测试的是视觉定位 + 自运动感知 + 空间记忆映射能力。
 
 ---
 
-## 非对称式长官-被测智能体架构
+## 四 Agent 架构（V2.2）
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│              Supervisor Agent（长官模型）                │
-│         claude-sonnet-4-6  ← 出题 + 错题诊断             │
-└──────────────────────┬──────────────────────────────────┘
-                       │ 派发考题 / 收集回答
-        ┌──────────────┼──────────────┐
-        ▼              ▼              ▼
-   Kimi (Moonshot)  MiniMax       豆包 (Doubao)
-   长序列空间记忆   多模态辨识度   空间几何计算
-   遗忘边界测试     物体幻觉率     方位转换正确率
+┌─────────────────────────────────────────────────────────────────┐
+│  Agent 1 — Claude Sonnet 4.6（Examiner）                        │
+│  输入：关键帧图像 + 精确位姿轨迹                                  │
+│  输出：exam_v2.json（5 题 / 场景，含 reasoning_trace）            │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Agent 2 — GPT-4o（Quality Checker）                            │
+│  输入：同一批关键帧图像 + 轨迹数据 + Claude 的题目               │
+│  职责：① 独立验算答案数学正确性                                   │
+│        ② 判断题干是否真正考察了视觉空间推理                       │
+│  输出：exam_refined_v2.json（删错题 / 更正答案 / 优化题干）       │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ 精炼考卷
+           ┌────────────────┴────────────────┐
+           ▼                                  ▼
+┌──────────────────┐              ┌──────────────────────┐
+│  Agent 3a        │              │  Agent 3b             │
+│  Kimi (kimi-k2.5)│              │  豆包 (Doubao)        │
+│  Moonshot API    │              │  火山引擎 Ark          │
+└────────┬─────────┘              └──────────┬───────────┘
+         └────────────────┬──────────────────┘
+                          │ 作答结果
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Agent 4 — Claude Sonnet 4.6（Reflector）                       │
+│  输入：错题 + 精炼考卷 + 位姿轨迹 + 关键帧图像                   │
+│  职责：三步排除法根因诊断                                         │
+│  输出：diagnosis_*.json（错误类型 + 置信度 + 推导过程）           │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 系统架构与数据流
+## 数据流
 
 ```
-视频序列 (Habitat 3D)
-    │
-    ▼
-[cv2_processor.py]  数据感知层
-    关键帧提取（yaw 阈值 + 光流运动分数）
-    6-DoF 位姿解析 → TrajectorySegment JSON
-    │
-    ▼
-[claude_examiner.py]  考试生成器（Supervisor Agent）
-    Claude Sonnet 4.6 自动出题
-    四类能力：方向记忆 / 遮挡推理 / 路径回溯 / 距离估算
-    输出 exam_raw.json
-    │
-    ▼
-[evaluate_runner.py]  测试执行器
-    统一适配器接口 → 派发给 Kimi / MiniMax / 豆包
-    记录响应时间 + token 消耗
-    │
-    ▼  （答案错误时触发）
-[claude_reflector.py]  错题分析器（Inspector Agent）
-    四步排除法 + ChromaDB RAG 物理规则库
-    输出 ErrorAnalysis JSON
-    │
-    ▼
-[analytics_viz.py]  可视化层
-    雷达图 / 遗忘曲线 / 热力图 / 综合报告
-    │
-    ▼
-[app.py]  Streamlit 交互看板
+VL-LN-Bench 数据集（10 场景 × tar.gz）
+    ↓  tools/extract_all_episodes.py
+data/VL-LN-Bench/extracted/<SCENE>/episode_000000/
+    trajectory.json / rgb/ / depth/
+    ↓  core/habitat_metadata_builder.py
+episode_000000/metadata.json
+（关键帧标注 + 偏航角 + 位移增量）
+    ↓  [Step 3]  core/claude_examiner.py
+outputs/runs/<RUN_ID>/exams/exam_<SCENE>_episode_000000.json
+    ↓  [Step 3.5] core/gpt_quality_checker.py
+outputs/runs/<RUN_ID>/exams/exam_refined_<SCENE>_episode_000000.json
+    ↓  [Step 4]  core/evaluate_runner.py（Kimi + 豆包）
+outputs/runs/<RUN_ID>/answers/result_<MODEL>_<SCENE>_episode_000000.json
+    ↓  [Step 5]  core/claude_reflector.py（三步排除法）
+outputs/runs/<RUN_ID>/reports/diagnosis_<MODEL>_<SCENE>_episode_000000.json
+    ↓  [Step 6]  core/analytics_viz.py
+outputs/runs/<RUN_ID>/visualizations/
 ```
 
 ---
@@ -76,8 +81,6 @@
 ### 1. 环境配置
 
 ```bash
-conda create -n selfphy python=3.10
-conda activate selfphy
 pip install -r requirements.txt
 ```
 
@@ -85,180 +88,92 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
+# 编辑 .env 填写各模型 API 密钥
 ```
 
-编辑 `.env`：
+`.env` 变量说明：
 
 ```env
-# 长官模型（必填）
+# Agent 1: Claude 出题模型（必填）
 ANTHROPIC_API_KEY=sk-ant-xxxxx
-ANTHROPIC_BASE_URL=https://api.anthropic.com   # 国内可替换为代理地址
+ANTHROPIC_BASE_URL=https://api.anthropic.com   # 支持代理地址
 
-# 被测模型（按需填写）
-MOONSHOT_API_KEY=xxxxx          # Kimi
-MINIMAX_API_KEY=xxxxx           # MiniMax
-DOUBAO_API_KEY=xxxxx            # 豆包
-DOUBAO_ENDPOINT=xxxxx
+# Agent 2: GPT-4o 质检模型（必填）
+OPENAI_API_KEY=sk-xxxxx
+OPENAI_BASE_URL=https://api.openai.com/v1       # 支持代理地址
+OPENAI_MODEL=gpt-4o
+
+# Agent 3a: Kimi 被测模型
+MOONSHOT_API_KEY=sk-xxxxx
+MOONSHOT_BASE_URL=https://api.moonshot.cn/v1
+MOONSHOT_MODEL=kimi-k2.5
+
+# Agent 3b: 豆包被测模型
+DOUBAO_API_KEY=ark-xxxxx
+DOUBAO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+DOUBAO_MODEL=ep-xxxxxxxxxxxxxxxx   # 火山引擎视觉 endpoint ID
 ```
 
-### 3. 准备数据
-
-如无真实 Habitat 数据，可生成示例数据：
+### 3. 运行完整评测
 
 ```bash
-python create_sample_data.py                        # 默认 3 个 episode
-python create_sample_data.py --num-episodes 5 --num-frames 40
+# 全新运行（自动生成 RUN_ID）
+nohup bash run_full_pipeline.sh > /tmp/pipeline.log 2>&1 &
+
+# 指定 RUN_ID
+RUN_ID=run2 nohup bash run_full_pipeline.sh > /tmp/pipeline.log 2>&1 &
+
+# 复用已有考卷（跳过 Claude 出题，直接从 GPT 质检开始）
+RUN_ID=run2 EXAM_SOURCE_RUN=run1 nohup bash run_full_pipeline.sh > /tmp/pipeline.log 2>&1 &
 ```
 
-### 4. 运行评测
+Pipeline 自动执行以下步骤（已完成的步骤自动 skip）：
+
+| 步骤 | 模块 | 说明 |
+|------|------|------|
+| Step 1 | `tools/extract_all_episodes.py` | 从 tar.gz 解压场景数据 |
+| Step 2 | `core/habitat_metadata_builder.py` | 生成位姿 metadata |
+| Step 3 | `core/claude_examiner.py` | Claude 出题（每场景 5 题）|
+| Step 3.5 | `core/gpt_quality_checker.py` | GPT-4o 质检（验算答案 + 判断有效性）|
+| Step 4 | `core/evaluate_runner.py` | Kimi + 豆包答题 |
+| Step 5 | `core/claude_reflector.py` | Claude 错题根因诊断 |
+| Step 6 | `core/analytics_viz.py` | 生成可视化图表 |
+
+### 4. 查看结果
 
 ```bash
-# 单 episode 完整流程
-python run_pipeline.py
-
-# 批量处理所有 episode
-python run_pipeline_batch.py
-```
-
-### 5. 分步运行（高级）
-
-```bash
-python core/cv2_processor.py       # 提取关键帧与轨迹
-python core/claude_examiner.py     # 生成考题
-python core/evaluate_runner.py     # 派发给被测模型
-python core/claude_reflector.py    # 错题诊断
-python core/analytics_viz.py       # 生成可视化
-```
-
-### 6. 查看结果
-
-```bash
-streamlit run app.py               # 启动 Web 看板
-cat outputs/reports/DIAGNOSIS_*.md # 查看诊断报告
+streamlit run streamlit_dashboard_final.py --server.port 8501
+# 本地访问：ssh -N -L 8501:localhost:8501 <server>  →  http://localhost:8501
 ```
 
 ---
 
-## 模块说明
+## 五维能力评测体系
 
-### `core/cv2_processor.py` — 数据感知层
+| 能力维度 | 中文 | 题目示例 |
+|---------|------|---------|
+| `egocentric_memory` | 空间记忆 | "最初在你左边的物体现在在哪里？" |
+| `spatial_transformation` | 空间变换 | "转身后，原来左边的物体在哪里？" |
+| `occlusion_reasoning` | 遮挡推理 | "被遮挡前桌上有几件物体？" |
+| `trajectory_backtracking` | 轨迹回溯 | "退回 2 米后会回到初始门口吗？" |
+| `distance_estimation` | 距离估算 | "你距离初始沙发有多远？" |
 
-- 从 Habitat 帧序列中提取 6-DoF 位姿（position + quaternion）
-- 基于 yaw 偏转角（默认阈值 20°）和光流运动分数（默认阈值 15）筛选关键帧
-- 输出 `TrajectorySegment` 结构，含自然语言轨迹描述
-
-### `core/claude_examiner.py` — 考试生成器
-
-- 长官模型：`claude-sonnet-4-6`，启用 adaptive thinking 提升推理质量
-- 四类考题能力维度：
-  - **Relative Direction Memory**：转身后判断物体相对方向
-  - **Occlusion Reasoning**：物体被遮挡后的位置推断
-  - **Spatial Backtracking**：回溯路径中的空间关系
-  - **Distance Estimation**：运动距离与物体远近估算
-- 难度与 yaw 幅度正相关（<45° 简单 / 45-90° 中等 / >90° 困难）
-
-### `core/evaluate_runner.py` — 测试执行器
-
-- 统一适配器接口，支持多模态输入（图片 + 文本）
-- 支持模型：Claude / Kimi / MiniMax / 豆包 / GPT-4o
-- 自动重试 + 错误处理，记录响应时间和 token 消耗
-
-### `core/claude_reflector.py` — 错题分析器（四步排除法）
-
-| 步骤 | 名称 | 检测内容 |
-|------|------|----------|
-| Step 1 | 物理及语义对齐检查 | 方向矛盾、物理定律违反 |
-| Step 2 | 空间位置重塑验证 | 空间拓扑重建错误、距离估算偏差 |
-| Step 3 | 视场边界校验 | 遮挡问题、视野盲区、时间间隔过大 |
-| Step 4 | 根因分类归纳 | 自动归类为 6 种错误类型 |
-
-错误类型枚举：`physical_misalignment` / `spatial_topology_error` / `fov_boundary_issue` / `memory_decay` / `object_hallucination` / `occlusion_misunderstanding`
-
-### `core/rag_manager.py` — RAG 知识库
-
-- 基于 ChromaDB 的物理规则向量库
-- 内置 8 条空间物理规则，支持语义检索和标签过滤
-- 支持规则导入导出
-
-### `core/analytics_viz.py` — 可视化层
-
-- 雷达图：多模型错误类型对比
-- 遗忘曲线：时间间隔 vs 准确率
-- 热力图：空间层级 vs 时间间隔
-- 综合报告：多子图汇总
-
-### `app.py` — Streamlit 交互看板
-
-- 实时展示评测进度与结果
-- 支持多 episode、多模型对比视图
+**答案判断策略**：
+- 方向类（4 种）：同义词归一化 + 最长匹配（支持中英文别名、角度表示）
+- 距离类：允许 ±20% 数值误差范围
 
 ---
 
-## 数据格式规范
+## 六类错误根因（Claude Reflector 三步排除法）
 
-### 轨迹片段 `TrajectorySegment`
-
-```json
-{
-  "segment_id": "episode_001",
-  "video_source": "habitat/episode_001",
-  "start_time": 0.0,
-  "end_time": 10.0,
-  "spatial_narrative": "Agent moved forward 2.3m, then turned right 90°",
-  "keyframes": [
-    {
-      "frame_id": 42,
-      "image_path": "outputs/frames/frame_042.jpg",
-      "pose": {
-        "frame_id": 42,
-        "timestamp": 1.4,
-        "position": [1.2, 0.0, -3.5],
-        "orientation": [0.924, 0.0, 0.383, 0.0],
-        "euler_angles": [0.0, 0.0, 45.0]
-      },
-      "detected_objects": []
-    }
-  ]
-}
-```
-
-### 考题 `ExamItem`
-
-```json
-{
-  "question": "我站在走廊中，正前方是一扇门，左侧是书架。我向右转了90°后，请问书架现在在我的哪个方向？",
-  "answer": "左后方。向右转90°后，原来的左侧变为后方偏左。",
-  "capability": "Relative Direction Memory",
-  "difficulty": "简单",
-  "reasoning_chain": "初始：门=前，书架=左。右转90°后坐标系旋转，书架相对新朝向为左后方。",
-  "frame_name": "frame_042.jpg",
-  "yaw": 90.0,
-  "motion_score": 28.5,
-  "image_path": "outputs/frames/frame_042.jpg"
-}
-```
-
-### 错误分析 `ErrorAnalysis`
-
-```json
-{
-  "question_id": "Q001_recall",
-  "model_name": "kimi",
-  "error_type": "spatial_topology_error",
-  "causal_trace": [
-    {
-      "step_name": "Physical Alignment Check",
-      "hypothesis": "Model's answer violates physical laws",
-      "evidence": ["Model mentioned opposite direction: right"],
-      "conclusion": "Physical misalignment detected",
-      "confidence": 0.8
-    }
-  ],
-  "root_cause": "Model failed to reconstruct spatial topology after rotation",
-  "confidence": 0.72,
-  "timestamp": "2026-06-01T10:30:00"
-}
-```
+| 错误类型 | 说明 |
+|---------|------|
+| `direction_calc_error` | 方向计算错误（如左右混淆） |
+| `rotation_sense_error` | 旋转方向错误（顺逆时针判断失误） |
+| `rotation_translation_confusion` | 旋转/平移混淆 |
+| `memory_decay` | 空间记忆衰减（长序列后遗忘初始状态） |
+| `object_hallucination` | 物体幻觉（凭空出现未见过的物体） |
+| `fov_misunderstanding` | 视野误解（误判视场范围内外） |
 
 ---
 
@@ -266,27 +181,39 @@ cat outputs/reports/DIAGNOSIS_*.md # 查看诊断报告
 
 ```
 outputs/
-├── frames/                    # 关键帧图片
-│   └── frame_042.jpg
-├── metadata/                  # 帧元数据
-│   └── metadata.json
-├── trajectories/              # 轨迹 JSON
-│   └── episode_001.json
-├── exams/                     # 生成的考题
-│   ├── exam_raw.json
-│   └── exam_episode_001.json
-├── answers/                   # 模型回答
-│   └── responses_kimi_20260601_103000.json
-├── reports/                   # 分析报告
-│   ├── error_analysis_20260601_103000.json
-│   ├── basic_report_20260601_103000.txt
-│   └── DIAGNOSIS_20260601_103000.md
-└── visualizations/            # 可视化图表
-    ├── radar_chart.png
-    ├── forgetting_curve.png
-    ├── heatmap.png
-    └── comprehensive_report.png
+└── runs/
+    └── <RUN_ID>/
+        ├── exams/
+        │   ├── exam_<SCENE>_episode_000000.json          # Claude 原始考卷
+        │   └── exam_refined_<SCENE>_episode_000000.json  # GPT-4o 精炼考卷
+        ├── answers/
+        │   └── result_<MODEL>_<SCENE>_episode_000000.json
+        ├── reports/
+        │   └── diagnosis_<MODEL>_<SCENE>_episode_000000.json
+        ├── visualizations/
+        │   ├── radar_chart.png
+        │   ├── difficulty_accuracy.png
+        │   ├── error_pie.png
+        │   └── summary.png
+        └── pipeline.log
 ```
+
+---
+
+## 模块说明
+
+| 模块 | 职责 |
+|------|------|
+| `core/habitat_metadata_builder.py` | Habitat 位姿解析，提取偏航角/位移，标注关键帧 |
+| `core/claude_examiner.py` | Agent 1：出题，5 类能力，extended thinking，3 次重试 |
+| `core/gpt_quality_checker.py` | Agent 2：逐题质检，图像+轨迹双验证，输出精炼考卷 |
+| `core/evaluate_runner.py` | Agent 3：多模型评测，支持 kimi / doubao |
+| `core/claude_reflector.py` | Agent 4：三步排除法错因诊断，6 类根因分类 |
+| `core/analytics_viz.py` | 生成静态图表（雷达图、柱状图、饼图） |
+| `schema/question.py` | Pydantic 数据模型：QuestionV2 / ExamPaperV2 / EvaluationResultV2 |
+| `streamlit_dashboard_final.py` | 交互式仪表盘，支持 RUN_ID 批次切换 |
+| `tools/extract_all_episodes.py` | VL-LN-Bench tar.gz 解析 |
+| `run_full_pipeline.sh` | 一键 Pipeline，含 skip 逻辑和 RUN_ID 管理 |
 
 ---
 
@@ -295,29 +222,28 @@ outputs/
 ```
 SelfPhy-Agent-System/
 ├── core/
-│   ├── cv2_processor.py        # 数据感知层：关键帧提取 + 6-DoF 解析
-│   ├── habitat_loader.py       # Habitat 数据加载器
-│   ├── claude_examiner.py      # 考试生成器（Supervisor Agent）
-│   ├── claude_adapter.py       # Claude API 适配器
-│   ├── claude_reflector.py     # 错题分析器（Inspector Agent）
-│   ├── evaluate_runner.py      # 测试执行器（多模型适配）
-│   ├── exam_formatter.py       # 考题格式化器
-│   ├── prompt_generator.py     # Prompt 构建工具
-│   ├── rag_manager.py          # RAG 知识库（ChromaDB）
-│   ├── analytics_viz.py        # 可视化层
-│   └── metadata_exporter.py    # 元数据导出器
-├── config/
-│   ├── model_config.json       # 模型配置（含 API 端点）
-│   └── model_config.example.json
+│   ├── habitat_metadata_builder.py   # Habitat 数据处理
+│   ├── claude_examiner.py            # Agent 1: 出题
+│   ├── gpt_quality_checker.py        # Agent 2: 质检
+│   ├── evaluate_runner.py            # Agent 3: 多模型评测
+│   ├── claude_reflector.py           # Agent 4: 错因诊断
+│   └── analytics_viz.py              # 静态可视化
+├── schema/
+│   └── question.py                   # Pydantic 数据模型
+├── tools/
+│   └── extract_all_episodes.py       # VL-LN-Bench 解析
 ├── data/
-│   ├── raw/habitat/            # 原始 Habitat 数据
-│   └── chroma_db/              # ChromaDB 向量数据库
-├── outputs/                    # 评测输出（自动生成）
-├── app.py                      # Streamlit 交互看板
-├── run_pipeline.py             # 单 episode 完整流程
-├── run_pipeline_batch.py       # 批量处理脚本
-├── create_sample_data.py       # 示例数据生成器
-├── test_claude_quick.py        # Claude API 快速测试
+│   └── VL-LN-Bench/
+│       ├── traj_data/mp3d_split2/    # 原始 tar.gz
+│       └── extracted/                # 提取后的场景数据
+├── outputs/
+│   └── runs/                         # 每次运行独立目录
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── ARCHITECTURE_REVIEW.md
+│   └── QUICKSTART.md
+├── streamlit_dashboard_final.py      # Streamlit 仪表盘
+├── run_full_pipeline.sh              # 一键 Pipeline
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -325,56 +251,52 @@ SelfPhy-Agent-System/
 
 ---
 
-## 技术栈
-
-| 层次 | 技术 |
-|------|------|
-| 仿真环境 | Meta Habitat 3D + Ego4D |
-| 数据处理 | OpenCV-headless, NumPy, SciPy |
-| AI 编排 | Anthropic Claude (claude-sonnet-4-6) |
-| 被测模型 | Kimi (Moonshot), MiniMax, 豆包 (Doubao) |
-| 向量数据库 | ChromaDB |
-| 可视化 | Matplotlib, Seaborn, Plotly |
-| 前端看板 | Streamlit |
-| 运行环境 | Python 3.10, Conda, Ubuntu (阿里云) |
-
----
-
 ## 常见问题
 
-**Q: API 调用失败（ConnectionError）**
+**Q: 如何复用已有考卷跳过 Claude 出题？**
 
-检查 `.env` 中的 `ANTHROPIC_API_KEY` 是否正确，国内环境可在 `.env` 中设置 `ANTHROPIC_BASE_URL` 为代理地址。
+```bash
+RUN_ID=run2 EXAM_SOURCE_RUN=run1 bash run_full_pipeline.sh
+```
+Pipeline 会从 run1/exams/ 复制原始考卷到 run2/exams/，然后从 Step 3.5（GPT 质检）开始执行。
 
-**Q: 没有生成报告**
+**Q: 数据已提取过，会重新解压吗？**
 
-确认 API 调用成功后查看 `outputs/reports/basic_report_*.txt`，至少需要有成功回答才能生成完整报告。
+不会。每个场景目录下有 `.extracted` 标记，pipeline 检测到后直接 skip。
 
-**Q: 只处理了一个 episode**
+**Q: 如何只重跑某个步骤？**
 
-使用 `run_pipeline_batch.py` 批量处理所有 episode。
+删除对应输出文件后重跑：
+- 重新质检：`rm outputs/runs/<RUN_ID>/exams/exam_refined_*.json`
+- 重新答题：`rm outputs/runs/<RUN_ID>/answers/*.json`
+- 全新一轮：指定新 `RUN_ID` 运行
 
-**Q: 如何添加新的被测模型**
+**Q: GPT-4o 质检失败了怎么办？**
 
-在 `config/model_config.json` 中添加模型配置，并在 `core/evaluate_runner.py` 中实现对应的适配器类。
+质检失败时自动降级：原始考卷直接复制为精炼考卷，pipeline 继续执行，不中断。
 
 ---
 
 ## 更新日志
 
-### 2026-06-01
-- 将长官模型统一为 `claude-sonnet-4-6`，启用 adaptive thinking
-- 新增 `claude_examiner.py`（替代旧版 `gpt4o_examiner.py`）
-- 新增 `claude_reflector.py`（替代旧版 `gpt4o_reflector.py`）
-- 新增 `claude_adapter.py` 统一 Claude API 调用层
-- 新增批量处理支持（`run_pipeline_batch.py`）
-- 完善报告生成逻辑（失败时也生成基础报告）
+### 2026-06-17（V2.2）
+- 新增 GPT-4o Quality Checker（Step 3.5）：基于关键帧图像 + 轨迹数据逐题验证
+  - ① 独立验算 ground_truth_answer 数学正确性
+  - ② 判断题干是否真正考察了视觉空间推理
+  - 支持 delete / fix_answer / rewrite / keep 四种操作
+- Pipeline 新增 `EXAM_SOURCE_RUN` 参数，支持复用已有考卷
+- 架构升级为四 Agent 结构
 
-### 2026-05-28（初始版本）
-- 实现完整评测流水线
-- 支持多模型适配器接口
-- 四步排除法错误诊断
-- Streamlit 可视化看板
+### 2026-06-06（V2.1）
+- 引入 RUN_ID 输出版本管理
+- 新增 Streamlit 仪表盘批次选择器
+- MiniMax 替换为豆包（MiniMax 无图像能力）
+- 修复 Claude Examiner 偶发 JSON 解析错误
+
+### 2026-06-04（V2.0）
+- V1 → V2 核心重构：被测模型只能通过图像序列推理，不再接收文字场景描述
+- 接入 VL-LN-Bench 真实数据集（10 场景）
+- 实现五维能力评测体系 + 六类错误根因分类
 
 ---
 

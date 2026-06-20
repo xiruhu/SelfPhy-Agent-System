@@ -50,17 +50,17 @@ def quaternion_to_euler(qw: float, qx: float, qy: float, qz: float) -> Tuple[flo
     return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
 
 
+def angle_diff(a: float, b: float) -> float:
+    """
+    有符号最短角度差 a - b，结果归一化到 (-180, 180]。
+    正确处理 yaw 在 ±180° 处的跳变（wraparound）。
+    """
+    return (a - b + 180.0) % 360.0 - 180.0
+
+
 def compute_displacement(pos1: List[float], pos2: List[float]) -> float:
-    """
-    计算两个位置之间的欧式距离
-
-    Args:
-        pos1, pos2: [x, y, z] 坐标
-
-    Returns:
-        距离（米）
-    """
-    return np.linalg.norm(np.array(pos2) - np.array(pos1))
+    """计算两点欧氏距离（米）。"""
+    return float(np.linalg.norm(np.array(pos2) - np.array(pos1)))
 
 
 def compute_motion_score(
@@ -121,6 +121,7 @@ def extract_keyframes(
     first_frame["yaw"] = yaw
     first_frame["displacement_from_prev"] = 0.0
     first_frame["motion_score"] = 0.0
+    first_frame["delta_yaw"] = 0.0
 
     keyframes.append(first_frame)
 
@@ -136,24 +137,22 @@ def extract_keyframes(
         current_frame["euler_angles"] = [roll, pitch, yaw]
         current_frame["yaw"] = yaw
 
-        # 计算与上一个关键帧的差异
-        delta_yaw = abs(yaw - prev_keyframe["yaw"])
+        # angle_diff 正确处理 ±180° wraparound，结果有符号（正=右转，负=左转）
+        delta_yaw = angle_diff(yaw, prev_keyframe["yaw"])
         displacement = compute_displacement(
             prev_keyframe["position"],
             current_frame["position"]
         )
         time_delta = current_frame["timestamp"] - prev_keyframe["timestamp"]
 
-        # 计算运动分数
-        motion_score = compute_motion_score(delta_yaw, displacement, time_delta)
+        motion_score = compute_motion_score(abs(delta_yaw), displacement, time_delta)
 
         current_frame["displacement_from_prev"] = displacement
         current_frame["motion_score"] = motion_score
-        current_frame["delta_yaw"] = delta_yaw
+        current_frame["delta_yaw"] = delta_yaw  # 有符号：正=右转，负=左转
 
-        # 判断是否为关键帧
         is_keyframe = (
-            delta_yaw >= yaw_threshold or
+            abs(delta_yaw) >= yaw_threshold or
             displacement >= displacement_threshold or
             motion_score >= motion_score_threshold
         )
@@ -205,13 +204,14 @@ def build_metadata(
         for i in range(len(trajectory) - 1)
     )
 
+    # 逐帧累加 angle_diff，避免 ±180° wraparound 导致重复计算
     total_rotation = 0.0
     for i in range(len(trajectory) - 1):
         rot1 = trajectory[i]["rotation"]
         rot2 = trajectory[i+1]["rotation"]
         _, _, yaw1 = quaternion_to_euler(rot1[0], rot1[1], rot1[2], rot1[3])
         _, _, yaw2 = quaternion_to_euler(rot2[0], rot2[1], rot2[2], rot2[3])
-        total_rotation += abs(yaw2 - yaw1)
+        total_rotation += abs(angle_diff(yaw2, yaw1))
 
     # 构建 metadata
     metadata = {

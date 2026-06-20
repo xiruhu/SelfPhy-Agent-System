@@ -200,30 +200,55 @@ def load_keyframe_images(
     return images
 
 
+def _angle_diff(a: float, b: float) -> float:
+    """有符号最短角度差 a - b，归一化到 (-180, 180]，处理 ±180° wraparound。"""
+    return (a - b + 180.0) % 360.0 - 180.0
+
+
 def compute_cumulative_trajectory(keyframes: List[Dict]) -> List[Dict]:
     """
     从关键帧列表计算累计旋转和累计位移，用于精确出题。
 
+    cum_yaw_delta 通过逐帧累加 angle_diff 得到，正确处理跨越 ±180° 的轨迹。
+    delta_yaw 字段优先使用 metadata 中已存的有符号值（由修复后的 builder 写入）；
+    若缺失则回退到 angle_diff 计算。
+
     Returns:
-        每帧附带 cum_yaw（从起始帧累计的 yaw 变化量）和 cum_displacement 的列表
+        每帧附带 cum_yaw_delta（从起始帧累计转向量）和 cum_displacement 的列表
     """
     result = []
     cum_yaw = 0.0
     cum_disp = 0.0
-    base_yaw = keyframes[0].get("yaw", 0.0) if keyframes else 0.0
+    prev_yaw = keyframes[0].get("yaw", 0.0) if keyframes else 0.0
 
-    for kf in keyframes:
-        cum_yaw = kf.get("yaw", 0.0) - base_yaw   # 相对起始 yaw 的偏移
+    for i, kf in enumerate(keyframes):
+        cur_yaw = kf.get("yaw", 0.0)
+
+        if i == 0:
+            step_yaw = 0.0
+        else:
+            # 优先使用 metadata 中已有的有符号 delta_yaw（builder 已修复）
+            # 若为旧数据（绝对值），回退到 angle_diff 重新计算
+            stored = kf.get("delta_yaw", None)
+            if stored is not None and abs(stored) <= 180.0:
+                step_yaw = stored
+            else:
+                step_yaw = _angle_diff(cur_yaw, prev_yaw)
+
+        cum_yaw += step_yaw
         cum_disp += kf.get("displacement_from_prev", 0.0)
+
         result.append({
             "frame_id": kf["frame_id"],
             "timestamp": round(kf["timestamp"], 3),
-            "yaw": round(kf.get("yaw", 0.0), 2),          # 绝对 yaw（度）
-            "cum_yaw_delta": round(cum_yaw, 2),            # 相对起始帧的累计转向量
-            "cum_displacement": round(cum_disp, 3),        # 累计位移（米）
-            "delta_yaw": round(kf.get("delta_yaw", 0.0), 2),  # 与上一关键帧的 yaw 差
-            "pos": [round(v, 3) for v in kf["position"]],  # 绝对坐标
+            "yaw": round(cur_yaw, 2),
+            "cum_yaw_delta": round(cum_yaw, 2),
+            "cum_displacement": round(cum_disp, 3),
+            "delta_yaw": round(step_yaw, 2),
+            "pos": [round(v, 3) for v in kf["position"]],
         })
+        prev_yaw = cur_yaw
+
     return result
 
 
@@ -381,16 +406,31 @@ def call_claude_examiner(
         if block.type == "text":
             response_text += block.text
 
-    # 提取 JSON
+    # 提取 JSON：找第一个 [ 到最后一个 ] 之间的内容，处理嵌套结构
     try:
-        # 尝试直接解析
         questions_data = json.loads(response_text)
     except json.JSONDecodeError:
-        # 尝试提取 JSON 数组
-        import re
-        json_match = re.search(r'\[\s*\{.*?\}\s*\]', response_text, re.DOTALL)
-        if json_match:
-            questions_data = json.loads(json_match.group(0))
+        start = response_text.find('[')
+        end = response_text.rfind(']')
+        if start != -1 and end != -1 and end > start:
+            try:
+                questions_data = json.loads(response_text[start:end+1])
+            except json.JSONDecodeError:
+                # 逐字符匹配平衡括号
+                depth = 0
+                json_end = start
+                for i, ch in enumerate(response_text[start:], start):
+                    if ch == '[':
+                        depth += 1
+                    elif ch == ']':
+                        depth -= 1
+                        if depth == 0:
+                            json_end = i
+                            break
+                try:
+                    questions_data = json.loads(response_text[start:json_end+1])
+                except Exception as e:
+                    raise ValueError(f"无法从 Claude 响应中提取 JSON：{response_text[:500]}") from e
         else:
             raise ValueError(f"无法从 Claude 响应中提取 JSON：{response_text[:500]}")
 
@@ -499,7 +539,7 @@ def generate_exam_v2(
 
     # 构建 MultimodalEvidence
     # 使用【全部关键帧】，不仅限于 evidence_frame_ids
-    # 理由：待测模型需要看完整的运动过程才能作答，只给几帧等于泄露答案
+    # 理由：Claude 出题时需要看运动变化显著的关键帧，保证出题质量
     rgb_frames = {}
     depth_frames = {}
     trajectory = []

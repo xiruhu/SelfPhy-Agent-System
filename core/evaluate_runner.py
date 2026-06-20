@@ -180,22 +180,23 @@ def prepare_multimodal_input_v2(
     准备被测模型的输入。
 
     设计原则：
-    - 传入 evidence_frame_ids 范围内的所有关键帧，不截断
+    - 发送 evidence 中的全部帧（按 frame_id 排序），不按 evidence_frame_ids 截断
+    - 这样即使题目引用了任意帧号，模型都能看到完整的运动过程
     - 不传轨迹数值（position/rotation），只传图像
-    - 待测模型只能通过"看视频"（连续帧序列）来推断空间关系
+    - 帧数超过 MAX_FRAMES 时均匀采样，避免超出 API token 限制
     """
-    # 取 evidence_frame_ids 覆盖范围内的所有关键帧，按 frame_id 排序
-    if question.evidence_frame_ids:
-        min_fid = min(question.evidence_frame_ids)
-        max_fid = max(question.evidence_frame_ids)
-    else:
-        min_fid, max_fid = 0, float('inf')
+    MAX_FRAMES = 80  # 实测 69 帧可通过，121 帧超限，取 80 作为安全上限
 
+    # 发送 evidence 中所有可用帧，按 frame_id 排序
     candidate = sorted(
-        [(int(k), v) for k, v in evidence["rgb_frames"].items()
-         if min_fid <= int(k) <= max_fid],
+        [(int(k), v) for k, v in evidence["rgb_frames"].items()],
         key=lambda x: x[0]
     )
+
+    # 均匀采样：超过 MAX_FRAMES 时等间隔抽取
+    if len(candidate) > MAX_FRAMES:
+        indices = [int(i * len(candidate) / MAX_FRAMES) for i in range(MAX_FRAMES)]
+        candidate = [candidate[i] for i in indices]
 
     frames = []
     for frame_id, rgb_path in candidate:
@@ -390,21 +391,74 @@ def call_minimax_api_v2(model_input: ModelInputV2) -> Dict[str, Any]:
 
 def call_doubao_api_v2(model_input: ModelInputV2) -> Dict[str, Any]:
     """
-    调用豆包 API
-
-    Args:
-        model_input: ModelInputV2 对象
-
-    Returns:
-        响应字典
+    调用豆包 API（火山引擎 Ark，OpenAI-compatible）
     """
-    # 豆包暂时返回占位符
-    return {
-        "model_response": "豆包 API 暂未实现多模态支持",
-        "response_time_ms": 0,
-        "error": "Not implemented",
-        "raw_response": None
-    }
+    import openai
+
+    api_key = os.getenv("DOUBAO_API_KEY")
+    base_url = os.getenv("DOUBAO_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+    model_name = os.getenv("DOUBAO_MODEL")  # endpoint ID, e.g. ep-xxxxxxxx
+
+    if not api_key:
+        raise ValueError("未找到 DOUBAO_API_KEY")
+    if not model_name:
+        raise ValueError("未找到 DOUBAO_MODEL（需填写 endpoint ID）")
+
+    client = openai.OpenAI(api_key=api_key, base_url=base_url)
+
+    message_content = [
+        {
+            "type": "text",
+            "text": (
+                f"以下是一段第一人称视角的连续图像序列（共 {len(model_input.frames)} 帧），"
+                f"按时间顺序排列，代表一个智能体在室内场景中的移动过程。\n\n"
+                f"请仔细观察这段视觉序列，然后回答问题：\n\n"
+                f"问题：{model_input.question_text}\n\n"
+                f"注意：请只根据图像内容作答，给出简洁明确的方向答案（如：正前方、左后方、正右方等）。"
+            )
+        }
+    ]
+
+    for i, frame in enumerate(model_input.frames):
+        if frame["rgb"]:
+            message_content.append({
+                "type": "text",
+                "text": f"[帧 {i+1}/{len(model_input.frames)}]"
+            })
+            message_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{frame['rgb']}"
+                }
+            })
+
+    start_time = time.time()
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": message_content}],
+            temperature=0.3,
+            max_tokens=1000,
+            timeout=600,
+        )
+
+        return {
+            "model_response": response.choices[0].message.content,
+            "response_time_ms": int((time.time() - start_time) * 1000),
+            "raw_response": {
+                "model": response.model,
+                "usage": response.usage.model_dump() if response.usage else None
+            }
+        }
+
+    except Exception as e:
+        return {
+            "model_response": "",
+            "response_time_ms": int((time.time() - start_time) * 1000),
+            "error": str(e),
+            "raw_response": None
+        }
 
 
 # ─────────────────────────────────────────────
